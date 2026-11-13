@@ -1,0 +1,135 @@
+openapi: 3.0.3
+info:
+  title: API Everything - core gateway
+  version: 0.1.0
+  description: >
+    One 16-digit API key for every connector, with weighted credits and zero
+    data retention. Only key hashes, credit counters and expiry dates are
+    stored; no IP, no email, no query history, no request log. A failed or
+    empty upstream response is never charged.
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:9000
+    description: Local gateway
+paths:
+  /health:
+    get:
+      summary: Gateway health, upstream list and key counters
+      responses:
+        "200": { description: OK }
+  /v1/usage:
+    get:
+      summary: Credits, expiry and rate-limit remaining for the current key
+      security: [{ ApiKey: [] }]
+      responses:
+        "200": { description: Usage }
+        "401": { description: INVALID_KEY }
+  /v1/redeem:
+    post:
+      summary: Redeem a one-time voucher for credits (no identity required)
+      description: >
+        Send either `key` (the raw 16-digit key, hashed server-side) or, when
+        CORE_ALLOW_CLIENT_HASH=1, `keyHash` (a client-generated SHA-256). In
+        the latter mode the gateway never sees the raw key. If neither is
+        provided, the gateway generates a key and returns it once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+                key: { type: string, pattern: "^[0-9]{16}$" }
+                keyHash: { type: string, pattern: "^[a-f0-9]{64}$" }
+      responses:
+        "200": { description: Redeemed }
+        "400": { description: BAD_VOUCHER / BAD_KEYHASH }
+        "403": { description: CLIENT_HASH_DISABLED }
+  /v1/keys:
+    get:
+      summary: List key hashes and counters (admin)
+      security: [{ AdminToken: [] }]
+      responses:
+        "200": { description: Keys }
+    post:
+      summary: Create a key (admin). The raw key is returned ONCE.
+      security: [{ AdminToken: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                credits: { type: integer, default: 5000 }
+                expiresInDays: { type: integer, default: 365 }
+      responses:
+        "201": { description: Created }
+  /v1/keys/{keyHash}:
+    delete:
+      summary: Revoke a key (admin)
+      security: [{ AdminToken: [] }]
+      parameters:
+        - in: path
+          name: keyHash
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Revoked }
+  /v1/keys/{keyHash}/topup:
+    post:
+      summary: Add credits to a key (admin)
+      security: [{ AdminToken: [] }]
+      parameters:
+        - in: path
+          name: keyHash
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Updated }
+  /v1/vouchers:
+    post:
+      summary: Issue a one-time credit voucher (admin)
+      security: [{ AdminToken: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                credits: { type: integer, default: 5000 }
+                expiresInDays: { type: integer, default: 365 }
+      responses:
+        "201": { description: Created }
+  /v1/{service}/{path}:
+    get:
+      summary: Proxy a connector request, debiting weighted credits on success
+      security: [{ ApiKey: [] }]
+      parameters:
+        - in: path
+          name: service
+          required: true
+          schema: { type: string, enum: [instagram, linkedin, tiktok] }
+        - in: path
+          name: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Upstream response, with X-Credits-* headers }
+        "401": { description: INVALID_KEY }
+        "402": { description: NO_CREDITS }
+        "403": { description: KEY_REVOKED / KEY_EXPIRED / ROUTE_BLOCKED }
+        "429": { description: RATE_LIMITED }
+        "502": { description: UPSTREAM_UNAVAILABLE }
+components:
+  securitySchemes:
+    ApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    AdminToken:
+      type: apiKey
+      in: header
+      name: X-Admin-Token

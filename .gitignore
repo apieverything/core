@@ -1,0 +1,11 @@
+node_modules
+package-lock.json
+bun.lock
+
+# Secrets and key database: never commit
+.env
+.env.*
+!.env.example
+.data/
+*.log
+.DS_Store

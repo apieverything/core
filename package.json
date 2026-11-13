@@ -1,0 +1,19 @@
+{
+  "name": "@api-everything/core-gateway",
+  "version": "0.1.0",
+  "description": "Unified gateway: one API key, weighted credits, zero data retention",
+  "license": "MIT",
+  "main": "server.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --env-file=.env server.js",
+    "test": "node --test tests/*.test.js",
+    "smoke": "node scripts/smoke.js"
+  },
+  "dependencies": {
+    "axios": "^1.21.1"
+  }
+}

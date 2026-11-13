@@ -1,0 +1,22 @@
+services:
+  core:
+    build: .
+    container_name: api-everything-core
+    restart: unless-stopped
+    ports:
+      - "${PORT:-9000}:9000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HOST: 0.0.0.0
+    volumes:
+      - core-data:/app/.data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  core-data:
