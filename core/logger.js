@@ -41,6 +41,7 @@ function routeTemplate(rawPath) {
     .replace(/\/v1\/(instagram|tiktok)\/[^/]+\/posts/g, "/v1/$1/:id/posts")
     .replace(/\/v1\/(instagram|tiktok)\/[^/]+/g, "/v1/$1/:id")
     .replace(/\/v1\/linkedin\/(jobs|company|people)\/[^/]+/g, "/v1/linkedin/$1/:id")
+    .replace(/\/v1\/admin\/accounts\/[a-f0-9]{64}/g, "/v1/admin/accounts/:hash")
     .replace(/\/v1\/keys\/[a-f0-9]{64}/g, "/v1/keys/:hash")
     .replace(/\/\d{6,}/g, "/:id");
 }
@@ -54,16 +55,16 @@ function boxLine(inner) {
 }
 function row(label, value) { log.plain(`  ${c.gray(label.padEnd(9))}   ${value}`); }
 
-function banner({ port, host, version, upstreams, keys, people }) {
+function banner({ port, host, version, upstreams, accounts, apiKeys, people }) {
   const title = `${c.bold(c.white("API Everything"))} ${c.gray("·")} ${c.bold(c.cyan("core gateway"))}`;
   log.plain("");
   log.plain(c.cyan(`┌${"─".repeat(BOX_WIDTH)}┐`));
   log.plain(boxLine(`${title}  ${c.gray(`v${version}`)}`));
-  log.plain(boxLine(c.dim("One key. Weighted credits. No data retained.")));
+  log.plain(boxLine(c.dim("Unlock code opens the account · rotatable API keys")));
   log.plain(c.cyan(`└${"─".repeat(BOX_WIDTH)}┘`));
   row("Listening", c.green(`http://${host}:${port}`));
   row("Upstreams", c.dim(Object.keys(upstreams).join(" · ") || "none"));
-  row("Keys", c.dim(`${keys} active`));
+  row("Accounts", c.dim(`${accounts} active · ${apiKeys} API keys`));
   row("Policy", people
     ? `${c.yellow("!")} ${c.yellow("people routes ALLOWED")}`
     : `${c.green("✓")} ${c.green("people routes blocked")}`);

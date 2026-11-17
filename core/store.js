@@ -3,9 +3,10 @@
 /**
  * Minimal persistent store.
  *
- * The on-disk record contains ONLY: key hash, credits, createdAt, expiresAt,
- * revoked. No IP, no email, no wallet, no query history, no request log.
- * Vouchers are stored as a code hash + credits + expiry + redeemed flag.
+ * The on-disk record contains ONLY hashes, credit counters, timestamps and
+ * revocation flags. No IP, no email, no wallet, no query history, no request
+ * log. Neither the 16-digit unlock code nor any API key is ever written in
+ * clear text.
  *
  * Writes are serialized through a promise chain and made atomic (write tmp,
  * then rename) so concurrent debits cannot corrupt the file.
@@ -14,12 +15,38 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 function emptyState() {
-  return { version: 1, keys: {}, vouchers: {} };
+  return { version: 2, accounts: {}, apiKeys: {}, vouchers: {} };
+}
+
+/**
+ * v1 stored `keys` (16-digit codes used directly as API keys). Those become
+ * accounts on read, preserving credits: the old code is now an unlock code.
+ * No API key is minted automatically — the owner unlocks the account and
+ * creates one. This is a one-way, in-place migration with no data loss.
+ */
+function normalize(parsed) {
+  if (!parsed || typeof parsed !== "object") return emptyState();
+  const accounts = { ...(parsed.accounts ?? {}) };
+  const apiKeys = { ...(parsed.apiKeys ?? {}) };
+  const vouchers = { ...(parsed.vouchers ?? {}) };
+  if (!parsed.keys) return { version: 2, accounts, apiKeys, vouchers };
+
+  for (const [hash, rec] of Object.entries(parsed.keys)) {
+    if (!accounts[hash]) {
+      accounts[hash] = {
+        credits: Number(rec?.credits) || 0,
+        createdAt: rec?.createdAt ?? new Date().toISOString(),
+        expiresAt: rec?.expiresAt ?? null,
+        revoked: Boolean(rec?.revoked),
+      };
+    }
+  }
+  return { version: 2, accounts, apiKeys, vouchers };
 }
 
 class MemoryStore {
   constructor(initial = null) {
-    this.state = initial ? structuredClone(initial) : emptyState();
+    this.state = normalize(initial);
     this.queue = Promise.resolve();
   }
   async read() { return structuredClone(this.state); }
@@ -48,8 +75,7 @@ class FileStore {
   }
   async read() {
     try {
-      const parsed = JSON.parse(fs.readFileSync(this.file, "utf8"));
-      return { version: 1, keys: parsed.keys ?? {}, vouchers: parsed.vouchers ?? {} };
+      return normalize(JSON.parse(fs.readFileSync(this.file, "utf8")));
     } catch {
       return emptyState();
     }
@@ -74,4 +100,4 @@ function createStore() {
   return new FileStore();
 }
 
-module.exports = { MemoryStore, FileStore, createStore, emptyState };
+module.exports = { MemoryStore, FileStore, createStore, emptyState, normalize };

@@ -1,9 +1,14 @@
 "use strict";
 
 const HINTS = {
-  INVALID_KEY: "Provide X-API-Key as a 16-digit key.",
-  KEY_REVOKED: "This key was revoked. Redeem a new voucher.",
-  KEY_EXPIRED: "This key expired. Top it up or redeem a new voucher.",
+  INVALID_UNLOCK_CODE: "Provide X-Unlock-Code as your 16-digit unlock code. It opens your account; it is NOT an API key.",
+  UNLOCK_CODE_NOT_API_KEY: "Unlock your account with the 16-digit code, then create an API key and use that in X-API-Key.",
+  INVALID_KEY: "Provide X-API-Key as an ae_… API key from your account. The 16-digit code is not an API key.",
+  KEY_REVOKED: "This API key was revoked. Create or reset one in your account.",
+  KEY_EXPIRED: "This account expired. Redeem a voucher to continue.",
+  ACCOUNT_REVOKED: "This account is revoked.",
+  KEY_NOT_FOUND: "That API key does not belong to this account.",
+  TOO_MANY_KEYS: "Too many API keys on this account. Revoke one first.",
   NO_CREDITS: "No credits left. Redeem a voucher to continue.",
   RATE_LIMITED: "Slow down. See Retry-After and CORE_RATE_PER_MIN.",
   ROUTE_BLOCKED: "This route is blocked by the gateway data policy.",
@@ -13,7 +18,7 @@ const HINTS = {
   ADMIN_REQUIRED: "Provide a valid X-Admin-Token.",
   BAD_VOUCHER: "Voucher not found, expired, or already redeemed.",
   BAD_KEYHASH: "keyHash must be a 64-character lowercase SHA-256 hex digest.",
-  CLIENT_HASH_DISABLED: "Set CORE_ALLOW_CLIENT_HASH=1 to redeem with a client-side key hash.",
+  CLIENT_HASH_DISABLED: "Set CORE_ALLOW_CLIENT_HASH=1 to redeem with a client-side account hash.",
   BAD_REQUEST: "Check the request body.",
 };
 

@@ -1,12 +1,16 @@
 openapi: 3.0.3
 info:
   title: API Everything - core gateway
-  version: 0.1.0
+  version: 0.2.0
   description: >
-    One 16-digit API key for every connector, with weighted credits and zero
-    data retention. Only key hashes, credit counters and expiry dates are
-    stored; no IP, no email, no query history, no request log. A failed or
-    empty upstream response is never charged.
+    Two different credentials. A 16-digit unlock code opens an account
+    (X-Unlock-Code); it is NEVER an API key. Inside the account you create,
+    rotate and revoke API keys (`ae_` + 48 hex) which are the only credentials
+    accepted in X-API-Key. Credits belong to the account, so rotating a key
+    never costs a credit. Only hashes, credit counters and timestamps are
+    stored: no IP, no email, no query history, no request log. A failed or
+    empty upstream response is never charged. PayAsYouGo: no subscription, no
+    monthly reset.
   license:
     name: MIT
 servers:
@@ -15,43 +19,114 @@ servers:
 paths:
   /health:
     get:
-      summary: Gateway health, upstream list and key counters
+      summary: Gateway health, account/key counters and connector list
       responses:
         "200": { description: OK }
-  /v1/usage:
+  /:
     get:
-      summary: Credits, expiry and rate-limit remaining for the current key
-      security: [{ ApiKey: [] }]
+      summary: Gateway description and endpoint index
       responses:
-        "200": { description: Usage }
-        "401": { description: INVALID_KEY }
-  /v1/signup:
-    post:
-      summary: Create a key with no identity (PayAsYouGo, key shown ONCE)
-      description: >
-        Public, identity-free account creation. Returns a 16-digit key with a
-        small starter balance and no expiry — no email, no subscription, no
-        monthly reset. The gateway stores only the SHA-256 hash of the key.
-        Rate-limited by a transient in-memory hash of the client address,
-        never persisted.
-      responses:
-        "201":
-          description: Created. Save the key now; it cannot be recovered.
-        "429": { description: RATE_LIMITED }
+        "200": { description: OK }
   /v1/status:
     get:
       summary: Public health of every configured connector
       description: Returns service names, availability and latency. Internal upstream URLs are never exposed.
       responses:
         "200": { description: Connector status }
+  /v1/signup:
+    post:
+      summary: Create an account with no identity (returns the 16-digit unlock code ONCE)
+      description: >
+        Public, identity-free account creation. Returns a 16-digit UNLOCK CODE
+        with a small starter balance and no expiry — no email, no subscription,
+        no monthly reset. The code opens the account via X-Unlock-Code; it is
+        NOT an API key. The gateway stores only its SHA-256 hash. Rate-limited
+        by a transient in-memory hash of the client address, never persisted.
+      responses:
+        "201":
+          description: Created. Save the unlock code now; it cannot be recovered.
+        "429": { description: RATE_LIMITED }
+  /v1/unlock:
+    post:
+      summary: Open an existing account with its 16-digit unlock code
+      security: [{ UnlockCode: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                unlockCode: { type: string, pattern: "^[0-9]{16}$" }
+      responses:
+        "200": { description: Account summary and active API key count }
+        "401": { description: INVALID_UNLOCK_CODE }
+  /v1/keys:
+    get:
+      summary: List this account's API keys (sanitized, no raw keys)
+      security: [{ UnlockCode: [] }]
+      responses:
+        "200": { description: Keys }
+        "401": { description: INVALID_UNLOCK_CODE }
+    post:
+      summary: Create a new API key. The raw `ae_` key is returned ONCE.
+      security: [{ UnlockCode: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, maxLength: 40, default: default }
+      responses:
+        "201": { description: Created }
+        "409": { description: TOO_MANY_KEYS }
+  /v1/keys/reset:
+    post:
+      summary: Reset ALL API keys — revoke every active key, issue a fresh one
+      security: [{ UnlockCode: [] }]
+      responses:
+        "201": { description: New API key }
+  /v1/keys/{keyId}:
+    delete:
+      summary: Revoke one API key
+      security: [{ UnlockCode: [] }]
+      parameters:
+        - in: path
+          name: keyId
+          required: true
+          description: SHA-256 hash of the API key (returned as keyId by GET /v1/keys)
+          schema: { type: string, pattern: "^[a-f0-9]{64}$" }
+      responses:
+        "200": { description: Revoked }
+        "404": { description: KEY_NOT_FOUND }
+  /v1/keys/{keyId}/reset:
+    post:
+      summary: Rotate one API key — revoke it and issue a replacement
+      security: [{ UnlockCode: [] }]
+      parameters:
+        - in: path
+          name: keyId
+          required: true
+          schema: { type: string, pattern: "^[a-f0-9]{64}$" }
+      responses:
+        "201": { description: New API key }
+        "404": { description: KEY_NOT_FOUND }
+  /v1/usage:
+    get:
+      summary: Credits, expiry, API key count and rate-limit remaining for the account
+      description: Accepts either X-API-Key (preferred) or X-Unlock-Code.
+      security: [{ ApiKey: [] }, { UnlockCode: [] }]
+      responses:
+        "200": { description: Usage }
+        "401": { description: INVALID_KEY / UNLOCK_CODE_NOT_API_KEY / INVALID_UNLOCK_CODE }
   /v1/redeem:
     post:
       summary: Redeem a one-time voucher for credits (no identity required)
       description: >
-        Send either `key` (the raw 16-digit key, hashed server-side) or, when
-        CORE_ALLOW_CLIENT_HASH=1, `keyHash` (a client-generated SHA-256). In
-        the latter mode the gateway never sees the raw key. If neither is
-        provided, the gateway generates a key and returns it once.
+        Credits an account addressed by `unlockCode`, `apiKey`, or a
+        client-generated `accountHash` (only when CORE_ALLOW_CLIENT_HASH=1).
+        If none is provided a fresh account and unlock code are created and
+        returned once. `key` is a deprecated alias for the 16-digit unlock code.
       requestBody:
         required: true
         content:
@@ -61,53 +136,13 @@ paths:
               required: [code]
               properties:
                 code: { type: string }
-                key: { type: string, pattern: "^[0-9]{16}$" }
-                keyHash: { type: string, pattern: "^[a-f0-9]{64}$" }
+                unlockCode: { type: string, pattern: "^[0-9]{16}$" }
+                apiKey: { type: string, pattern: "^ae_[a-f0-9]{48}$" }
+                accountHash: { type: string, pattern: "^[a-f0-9]{64}$" }
       responses:
         "200": { description: Redeemed }
         "400": { description: BAD_VOUCHER / BAD_KEYHASH }
         "403": { description: CLIENT_HASH_DISABLED }
-  /v1/keys:
-    get:
-      summary: List key hashes and counters (admin)
-      security: [{ AdminToken: [] }]
-      responses:
-        "200": { description: Keys }
-    post:
-      summary: Create a key (admin). The raw key is returned ONCE.
-      security: [{ AdminToken: [] }]
-      requestBody:
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                credits: { type: integer, default: 5000 }
-                expiresInDays: { type: integer, default: 365 }
-      responses:
-        "201": { description: Created }
-  /v1/keys/{keyHash}:
-    delete:
-      summary: Revoke a key (admin)
-      security: [{ AdminToken: [] }]
-      parameters:
-        - in: path
-          name: keyHash
-          required: true
-          schema: { type: string }
-      responses:
-        "200": { description: Revoked }
-  /v1/keys/{keyHash}/topup:
-    post:
-      summary: Add credits to a key (admin)
-      security: [{ AdminToken: [] }]
-      parameters:
-        - in: path
-          name: keyHash
-          required: true
-          schema: { type: string }
-      responses:
-        "200": { description: Updated }
   /v1/vouchers:
     post:
       summary: Issue a one-time credit voucher (admin)
@@ -122,9 +157,53 @@ paths:
                 expiresInDays: { type: integer, default: 365 }
       responses:
         "201": { description: Created }
+  /v1/admin/accounts:
+    get:
+      summary: List accounts (admin, hashes and counters only)
+      security: [{ AdminToken: [] }]
+      responses:
+        "200": { description: Accounts }
+    post:
+      summary: Create an account with a custom balance (admin)
+      security: [{ AdminToken: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                credits: { type: integer, default: 5000 }
+                expiresInDays: { type: integer, nullable: true, default: null }
+      responses:
+        "201": { description: Created. Unlock code returned once }
+  /v1/admin/accounts/{accountHash}:
+    delete:
+      summary: Revoke an account and all its API keys (admin)
+      security: [{ AdminToken: [] }]
+      parameters:
+        - in: path
+          name: accountHash
+          required: true
+          schema: { type: string, pattern: "^[a-f0-9]{64}$" }
+      responses:
+        "200": { description: Revoked }
+  /v1/admin/accounts/{accountHash}/topup:
+    post:
+      summary: Add credits to an account (admin)
+      security: [{ AdminToken: [] }]
+      parameters:
+        - in: path
+          name: accountHash
+          required: true
+          schema: { type: string, pattern: "^[a-f0-9]{64}$" }
+      responses:
+        "200": { description: Updated }
   /v1/{service}/{path}:
     get:
       summary: Proxy a connector request, debiting weighted credits on success
+      description: >
+        Requires an `ae_` API key in X-API-Key. Sending the 16-digit unlock code
+        here returns 401 UNLOCK_CODE_NOT_API_KEY with a hint to create an API key.
       security: [{ ApiKey: [] }]
       parameters:
         - in: path
@@ -137,17 +216,23 @@ paths:
           schema: { type: string }
       responses:
         "200": { description: Upstream response, with X-Credits-* headers }
-        "401": { description: INVALID_KEY }
+        "401": { description: INVALID_KEY / UNLOCK_CODE_NOT_API_KEY / KEY_REVOKED }
         "402": { description: NO_CREDITS }
-        "403": { description: KEY_REVOKED / KEY_EXPIRED / ROUTE_BLOCKED }
+        "403": { description: ROUTE_BLOCKED / ACCOUNT_REVOKED }
         "429": { description: RATE_LIMITED }
         "502": { description: UPSTREAM_UNAVAILABLE }
 components:
   securitySchemes:
+    UnlockCode:
+      type: apiKey
+      in: header
+      name: X-Unlock-Code
+      description: 16-digit code that OPENS the account. Never used for API calls.
     ApiKey:
       type: apiKey
       in: header
       name: X-API-Key
+      description: Rotatable `ae_` API key created inside the account.
     AdminToken:
       type: apiKey
       in: header

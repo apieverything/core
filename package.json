@@ -1,7 +1,7 @@
 {
   "name": "@api-everything/core-gateway",
-  "version": "0.1.0",
-  "description": "Unified gateway: one API key, weighted credits, zero data retention",
+  "version": "0.2.0",
+  "description": "Unified gateway: 16-digit unlock code, rotatable API keys, weighted credits, zero data retention",
   "license": "MIT",
   "main": "server.js",
   "engines": {

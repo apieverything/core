@@ -29,7 +29,7 @@ function resolveUpstream(pathname, map = upstreams()) {
 
 const HOPLESS = new Set([
   "host", "connection", "content-length", "transfer-encoding",
-  "x-api-key", "x-admin-token", "authorization", "cookie",
+  "x-api-key", "x-unlock-code", "x-admin-token", "authorization", "cookie",
 ]);
 
 function forwardHeaders(req) {

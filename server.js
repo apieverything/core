@@ -12,10 +12,10 @@ const { GatewayError } = require("./core/errors");
 const { createStore } = require("./core/store");
 const { RateLimiter } = require("./core/ratelimit");
 const { costFor, billable, isActive } = require("./core/ledger");
-const { assertKeyFormat, hashKey, timingSafeEqual } = require("./core/keys");
 const {
-  createKey, listKeys, revokeKey, topUpKey, createVoucher, redeemVoucher,
-} = require("./core/registry");
+  hashKey, assertApiKeyFormat, assertUnlockCodeFormat, timingSafeEqual,
+} = require("./core/keys");
+const registry = require("./core/registry");
 const { upstreams, resolveUpstream, forwardHeaders, forward } = require("./core/proxy");
 const { SignupLimiter, signup } = require("./core/signup");
 const { connectorStatus, resetStatusCache } = require("./core/status");
@@ -29,13 +29,14 @@ const ADMIN = () => process.env.CORE_ADMIN_TOKEN?.trim() || null;
 const TIMEOUT = () => Math.max(1000, Number(process.env.CORE_TIMEOUT_MS ?? 20000));
 const ALLOW_PEOPLE = () => process.env.CORE_ALLOW_PEOPLE === "1";
 const MAX_BODY = 64 * 1024;
+const CORS_HEADERS = "Content-Type, X-API-Key, X-Unlock-Code, X-Admin-Token";
 
 const CONFIG_KEYS = [
   "PORT", "HOST", "CORE_ADMIN_TOKEN", "CORE_UPSTREAMS",
   "CORE_INSTAGRAM_URL", "CORE_LINKEDIN_URL", "CORE_TIKTOK_URL",
   "CORE_COSTS", "CORE_RATE_PER_MIN", "CORE_TIMEOUT_MS",
   "CORE_ALLOW_PEOPLE", "CORE_ALLOW_CLIENT_HASH", "CORE_DEFAULT_CREDITS",
-  "CORE_STARTER_CREDITS", "CORE_SIGNUP_PER_HOUR",
+  "CORE_STARTER_CREDITS", "CORE_SIGNUP_PER_HOUR", "CORE_MAX_API_KEYS",
   "CORE_STORE", "CORE_DATA_DIR", "CORE_DATA_FILE",
   "LOG_LEVEL", "NO_COLOR", "FORCE_COLOR",
 ];
@@ -51,7 +52,7 @@ function send(res, status, payload, extra = {}) {
   if (status === 204) {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type, X-API-Key, X-Admin-Token",
+      "Access-Control-Allow-Headers": CORS_HEADERS,
       "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     });
     return res.end();
@@ -61,7 +62,7 @@ function send(res, status, payload, extra = {}) {
     "Content-Type": typeof payload === "string" ? "text/yaml; charset=utf-8" : "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(body),
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type, X-API-Key, X-Admin-Token",
+    "Access-Control-Allow-Headers": CORS_HEADERS,
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     ...extra,
   });
@@ -106,30 +107,80 @@ function requireAdmin(req) {
   }
 }
 
-async function authenticate(req, cost) {
-  const raw = req.headers["x-api-key"] ?? "";
-  assertKeyFormat(raw);
-  const keyHash = hashKey(raw);
+/**
+ * Management auth: the 16-digit unlock code. This header is NEVER forwarded
+ * to a connector and is never accepted as X-API-Key.
+ */
+async function requireUnlock(req, body = {}) {
+  const raw = req.headers["x-unlock-code"] ?? body.unlockCode ?? "";
+  assertUnlockCodeFormat(raw);
+  const accountHash = hashKey(raw);
   const state = await store.read();
-  const record = state.keys[keyHash];
-  if (!record) throw new GatewayError("INVALID_KEY", "Unknown API key.", 401);
-  if (record.revoked) throw new GatewayError("KEY_REVOKED", "Key revoked.", 403);
-  if (record.expiresAt && Date.parse(record.expiresAt) <= Date.now()) {
-    throw new GatewayError("KEY_EXPIRED", "Key expired.", 403);
-  }
-  if (record.credits < cost) throw new GatewayError("NO_CREDITS", "Not enough credits.", 402);
-  const rate = limiter.check(keyHash);
-  if (!rate.allowed) throw new GatewayError("RATE_LIMITED", "Rate limit exceeded.", 429);
-  return { keyHash, record, rate };
+  const account = state.accounts[accountHash];
+  if (!account) throw new GatewayError("INVALID_UNLOCK_CODE", "Unknown unlock code.", 401);
+  if (account.revoked) throw new GatewayError("ACCOUNT_REVOKED", "This account is revoked.", 403);
+  return { accountHash, account, unlockCode: raw };
 }
 
-async function debit(keyHash, cost) {
+/**
+ * API auth: an ae_… API key only. A 16-digit unlock code is rejected with an
+ * explicit UNLOCK_CODE_NOT_API_KEY error instead of a generic 401.
+ */
+async function authenticate(req, cost) {
+  const raw = req.headers["x-api-key"] ?? "";
+  assertApiKeyFormat(raw);
+  const keyHash = hashKey(raw);
+  const state = await store.read();
+  const meta = state.apiKeys[keyHash];
+  if (!meta) throw new GatewayError("INVALID_KEY", "Unknown API key.", 401);
+  if (meta.revoked) throw new GatewayError("KEY_REVOKED", "API key revoked.", 403);
+  const accountHash = meta.accountHash;
+  const account = state.accounts[accountHash];
+  if (!account) throw new GatewayError("INVALID_KEY", "Unknown API key.", 401);
+  if (account.revoked) throw new GatewayError("ACCOUNT_REVOKED", "This account is revoked.", 403);
+  if (account.expiresAt && Date.parse(account.expiresAt) <= Date.now()) {
+    throw new GatewayError("KEY_EXPIRED", "Account expired.", 403);
+  }
+  if (account.credits < cost) throw new GatewayError("NO_CREDITS", "Not enough credits.", 402);
+  // Rate limiting is per ACCOUNT, so several API keys share one budget.
+  const rate = limiter.check(accountHash);
+  if (!rate.allowed) throw new GatewayError("RATE_LIMITED", "Rate limit exceeded.", 429);
+  return { accountHash, account, keyHash, meta, rate };
+}
+
+/** Usage accepts either credential: an API key or the account unlock code. */
+async function resolveAccount(req, cost = 0) {
+  if (req.headers["x-api-key"]) return { ...(await authenticate(req, cost)), via: "apiKey" };
+  if (req.headers["x-unlock-code"]) {
+    const found = await requireUnlock(req);
+    const rate = limiter.check(found.accountHash);
+    return { ...found, rate, keyHash: null, via: "unlockCode" };
+  }
+  throw new GatewayError(
+    "INVALID_KEY",
+    "Provide X-API-Key (or X-Unlock-Code for account management).",
+    401
+  );
+}
+
+async function debit(accountHash, cost, keyHash) {
   const state = await store.write((current) => {
-    const record = current.keys[keyHash];
-    if (record && !record.revoked) record.credits = Math.max(0, record.credits - cost);
+    const account = current.accounts[accountHash];
+    if (account && !account.revoked) account.credits = Math.max(0, account.credits - cost);
+    const meta = keyHash ? current.apiKeys[keyHash] : null;
+    if (meta) meta.lastUsedAt = new Date().toISOString();
     return current;
   });
-  return state.keys[keyHash]?.credits ?? 0;
+  return state.accounts[accountHash]?.credits ?? 0;
+}
+
+async function touch(keyHash) {
+  if (!keyHash) return;
+  await store.write((current) => {
+    const meta = current.apiKeys[keyHash];
+    if (meta) meta.lastUsedAt = new Date().toISOString();
+    return current;
+  });
 }
 
 async function handle(req, res) {
@@ -145,19 +196,25 @@ async function handle(req, res) {
       return send(res, 200, {
         name: "API Everything - core gateway",
         version: pkg.version,
-        description: "One key, weighted credits, zero data retention.",
+        description: "A 16-digit unlock code opens your account; rotatable ae_… API keys call the APIs. Weighted credits, zero data retention.",
         upstreams: Object.keys(upstreams()),
         peopleRoutes: ALLOW_PEOPLE() ? "allowed" : "blocked",
-        dataPolicy: "Only key hashes, credit counters and expiry dates are stored.",
+        dataPolicy: "Only hashes, credit counters and timestamps are stored. No raw unlock code or API key is ever written.",
         model: "PayAsYouGo — no subscription, no monthly reset, top up with vouchers",
+        credentials: {
+          unlockCode: "16 digits · X-Unlock-Code · opens the account · NOT an API key",
+          apiKey: "ae_… · X-API-Key · create / reset / revoke from the account",
+        },
         endpoints: {
           health: "GET /health",
           status: "GET /v1/status",
-          signup: "POST /v1/signup (no identity, key shown once)",
-          usage: "GET /v1/usage",
+          signup: "POST /v1/signup (returns the unlock code ONCE)",
+          unlock: "POST /v1/unlock (X-Unlock-Code)",
+          keys: "GET|POST /v1/keys, POST /v1/keys/reset, DELETE /v1/keys/:id (X-Unlock-Code)",
+          usage: "GET /v1/usage (X-API-Key or X-Unlock-Code)",
           redeem: "POST /v1/redeem",
-          admin: "POST /v1/keys, POST /v1/vouchers (X-Admin-Token)",
-          proxy: "GET|POST /v1/:service/... (X-API-Key)",
+          admin: "POST /v1/vouchers, /v1/admin/accounts (X-Admin-Token)",
+          proxy: "GET|POST /v1/:service/... (X-API-Key only)",
           schema: "GET /openapi.yaml",
         },
       });
@@ -165,12 +222,15 @@ async function handle(req, res) {
 
     if (pathname === "/health") {
       const state = await store.read();
-      const keys = Object.values(state.keys);
+      const accounts = Object.values(state.accounts);
+      const apiKeys = Object.values(state.apiKeys);
       return send(res, 200, {
         status: "ok",
         upstreams: Object.keys(upstreams()),
-        keys: keys.length,
-        activeKeys: keys.filter((k) => isActive(k)).length,
+        accounts: accounts.length,
+        activeAccounts: accounts.filter((a) => isActive(a)).length,
+        apiKeys: apiKeys.length,
+        activeApiKeys: apiKeys.filter((k) => !k.revoked).length,
         vouchers: Object.values(state.vouchers).filter((v) => !v.redeemed).length,
         adminEnabled: Boolean(ADMIN()),
         peopleRoutes: ALLOW_PEOPLE() ? "allowed" : "blocked",
@@ -183,7 +243,7 @@ async function handle(req, res) {
       return send(res, 200, fs.readFileSync(file, "utf8"));
     }
 
-    // Public, identity-free signup. The key is shown once and never stored.
+    // Public, identity-free signup. Returns the UNLOCK CODE, shown once.
     if (pathname === "/v1/signup" && req.method === "POST") {
       const result = await signup(store, signupLimiter, req);
       return send(res, 201, result);
@@ -194,61 +254,101 @@ async function handle(req, res) {
       return send(res, 200, await connectorStatus());
     }
 
-    // Public voucher redemption: no identity, no key required.
+    // Public voucher redemption: no identity, credits an account.
     if (pathname === "/v1/redeem" && req.method === "POST") {
       const body = await readBody(req);
-      const result = await redeemVoucher(store, body);
+      const result = await registry.redeemVoucher(store, body);
       return send(res, 200, result);
     }
 
-    if (pathname === "/v1/usage") {
-      const raw = req.headers["x-api-key"] ?? "";
-      assertKeyFormat(raw);
-      const keyHash = hashKey(raw);
+    if (pathname === "/v1/usage" && req.method === "GET") {
+      const found = await resolveAccount(req, 0);
       const state = await store.read();
-      const record = state.keys[keyHash];
-      if (!record) throw new GatewayError("INVALID_KEY", "Unknown API key.", 401);
-      const rate = limiter.check(keyHash);
+      const activeKeys = Object.values(state.apiKeys)
+        .filter((m) => m.accountHash === found.accountHash && !m.revoked).length;
       return send(res, 200, {
-        keyHash,
-        credits: record.credits,
-        expiresAt: record.expiresAt,
-        revoked: record.revoked,
-        rateLimitRemaining: rate.remaining,
+        accountHash: found.accountHash,
+        credits: found.account.credits,
+        expiresAt: found.account.expiresAt,
+        revoked: found.account.revoked,
+        activeApiKeys: activeKeys,
+        rateLimitRemaining: found.rate.remaining,
+        authenticatedWith: found.via,
       });
     }
 
-    // ---- Admin routes ----
-    if (pathname.startsWith("/v1/keys") || pathname === "/v1/vouchers") {
-      requireAdmin(req);
-      if (pathname === "/v1/keys" && req.method === "POST") {
-        const body = await readBody(req);
-        const result = await createKey(store, {
-          credits: body.credits ?? Number(process.env.CORE_DEFAULT_CREDITS ?? 5000),
-          expiresInDays: body.expiresInDays ?? 365,
-        });
-        return send(res, 201, result);
-      }
-      if (pathname === "/v1/keys" && req.method === "GET") {
-        return send(res, 200, { keys: await listKeys(store) });
-      }
-      if (pathname === "/v1/vouchers" && req.method === "POST") {
-        const body = await readBody(req);
-        const result = await createVoucher(store, body);
-        return send(res, 201, result);
-      }
-      const keyMatch = pathname.match(/^\/v1\/keys\/([a-f0-9]{64})(\/topup)?$/);
-      if (keyMatch) {
-        if (req.method === "DELETE") return send(res, 200, await revokeKey(store, keyMatch[1]));
-        if (req.method === "POST" && keyMatch[2]) {
-          const body = await readBody(req);
-          return send(res, 200, await topUpKey(store, keyMatch[1], body.credits));
-        }
-      }
-      return send(res, 404, { error: { code: "NOT_FOUND", message: "Unknown management route." } });
+    // Unlock an existing account (explicit "open the account" endpoint).
+    if (pathname === "/v1/unlock" && req.method === "POST") {
+      const body = await readBody(req);
+      const found = await requireUnlock(req, body);
+      const state = await store.read();
+      const activeKeys = Object.values(state.apiKeys)
+        .filter((m) => m.accountHash === found.accountHash && !m.revoked).length;
+      return send(res, 200, {
+        accountHash: found.accountHash,
+        credits: found.account.credits,
+        expiresAt: found.account.expiresAt,
+        activeApiKeys: activeKeys,
+        next: activeKeys ? "Use an existing API key, or create/reset one." : "Create your first API key.",
+      });
     }
 
-    // ---- Proxied connector routes ----
+    // ---- Account-level API key management (X-Unlock-Code) ----
+    if (pathname === "/v1/keys" || pathname.startsWith("/v1/keys/")) {
+      const body = req.method === "POST" ? await readBody(req) : {};
+      const { accountHash } = await requireUnlock(req, body);
+
+      if (pathname === "/v1/keys" && req.method === "GET") {
+        return send(res, 200, { keys: await registry.listApiKeys(store, accountHash) });
+      }
+      if (pathname === "/v1/keys" && req.method === "POST") {
+        return send(res, 201, await registry.createApiKey(store, accountHash, { name: body.name }));
+      }
+      if (pathname === "/v1/keys/reset" && req.method === "POST") {
+        return send(res, 201, await registry.resetAllApiKeys(store, accountHash));
+      }
+      const keyMatch = pathname.match(/^\/v1\/keys\/([a-f0-9]{64})(\/reset)?$/);
+      if (keyMatch) {
+        if (req.method === "DELETE" && !keyMatch[2]) {
+          return send(res, 200, await registry.revokeApiKey(store, accountHash, keyMatch[1]));
+        }
+        if (req.method === "POST" && keyMatch[2]) {
+          return send(res, 201, await registry.resetApiKey(store, accountHash, keyMatch[1]));
+        }
+      }
+      return send(res, 404, { error: { code: "NOT_FOUND", message: "Unknown key management route." } });
+    }
+
+    // ---- Admin / operator routes (X-Admin-Token) ----
+    if (pathname === "/v1/vouchers" || pathname.startsWith("/v1/admin/")) {
+      requireAdmin(req);
+      const body = req.method === "POST" ? await readBody(req) : {};
+
+      if (pathname === "/v1/vouchers" && req.method === "POST") {
+        return send(res, 201, await registry.createVoucher(store, body));
+      }
+      if (pathname === "/v1/admin/accounts" && req.method === "POST") {
+        return send(res, 201, await registry.createAccount(store, {
+          credits: body.credits ?? Number(process.env.CORE_DEFAULT_CREDITS ?? 5000),
+          expiresInDays: body.expiresInDays ?? null,
+        }));
+      }
+      if (pathname === "/v1/admin/accounts" && req.method === "GET") {
+        return send(res, 200, { accounts: await registry.listAccounts(store) });
+      }
+      const accountMatch = pathname.match(/^\/v1\/admin\/accounts\/([a-f0-9]{64})(\/topup)?$/);
+      if (accountMatch) {
+        if (req.method === "DELETE" && !accountMatch[2]) {
+          return send(res, 200, await registry.revokeAccount(store, accountMatch[1]));
+        }
+        if (req.method === "POST" && accountMatch[2]) {
+          return send(res, 200, await registry.topUpAccount(store, accountMatch[1], body.credits));
+        }
+      }
+      return send(res, 404, { error: { code: "NOT_FOUND", message: "Unknown admin route." } });
+    }
+
+    // ---- Proxied connector routes (X-API-Key ONLY) ----
     const match = /^\/v1\/([^/]+)/.exec(pathname);
     if (!match || !["GET", "POST", "PUT", "DELETE", "HEAD"].includes(req.method)) {
       return send(res, 404, { error: { code: "NOT_FOUND", message: "Unknown route." } });
@@ -276,9 +376,13 @@ async function handle(req, res) {
     });
 
     const charged = billable(upstream.status, upstream.body);
-    remaining = charged
-      ? await debit(auth.keyHash, cost)
-      : auth.record.credits; // a failed or empty upstream is never charged
+    if (charged) {
+      remaining = await debit(auth.accountHash, cost, auth.keyHash);
+    } else {
+      // A failed or empty upstream is never charged, but the key was used.
+      await touch(auth.keyHash);
+      remaining = auth.account.credits;
+    }
 
     const headers = {
       "Content-Type": upstream.contentType,
@@ -291,6 +395,7 @@ async function handle(req, res) {
       ...headers,
       "Content-Length": Buffer.byteLength(upstream.body),
       "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": CORS_HEADERS,
     });
     return res.end(upstream.body);
   } catch (err) {
@@ -327,7 +432,8 @@ async function announce() {
   logger.banner({
     port: bound.port, host: bound.host, version: pkg.version,
     upstreams: upstreams(),
-    keys: Object.values(state.keys).filter((k) => isActive(k)).length,
+    accounts: Object.values(state.accounts).filter((a) => isActive(a)).length,
+    apiKeys: Object.values(state.apiKeys).filter((k) => !k.revoked).length,
     people: ALLOW_PEOPLE(),
   });
   logger.ready();
