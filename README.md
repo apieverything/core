@@ -1,6 +1,7 @@
 # API Everything — core gateway
 
 One key for every connector. Weighted credits. **Zero data retention.**
+**PayAsYouGo — no monthly subscription, no recurring billing, no monthly reset.**
 
 This is the unified entry point that makes the hosted tier possible: a single
 16-digit key works across Instagram, LinkedIn and TikTok, and a single credit
@@ -97,17 +98,45 @@ for our failures.
 Rate limiting is per key and per minute (`CORE_RATE_PER_MIN`, default 60),
 with `Retry-After: 60` on 429. Buckets are in memory, never persisted.
 
-## Keys and vouchers
+## PayAsYouGo, explicitly
+
+There is **no subscription**. A key created through `/v1/signup` has no expiry,
+credits never reset on a calendar date, and nothing is charged unless you
+actually make a successful request. You add quota only when you want to, by
+redeeming a prepaid voucher — the same model as a prepaid card, not a plan.
+
+```bash
+# Create an account with no identity, no email, no payment details
+curl -X POST http://localhost:9000/v1/signup
+# -> { "key": "1234567890123456", "credits": 50, "expiresAt": null,
+#      "model": "pay_as_you_go",
+#      "notice": "Save this key now. It is shown once and cannot be recovered." }
+
+# Later, only if you need more: redeem a prepaid voucher
+curl -X POST http://localhost:9000/v1/redeem \
+  -H "Content-Type: application/json" \
+  -d '{"code":"...","key":"1234567890123456"}'
+```
+
+Signup abuse protection hashes the client address with a **random per-process
+salt**, keeps it in memory for one hour and never writes it anywhere. After a
+restart there is nothing left to correlate. A new key gets
+`CORE_STARTER_CREDITS` (default 50) and `CORE_SIGNUP_PER_HOUR` (default 5)
+limits how many keys one network can mint per hour.
+
+## Routes
 
 | Route | Auth | Purpose |
 | --- | --- | --- |
+| `POST /v1/signup` | public | Create a key; **save it, shown once** |
+| `GET /v1/status` | public | Health of every connector |
+| `GET /v1/usage` | key | Credits, expiry, rate remaining |
+| `POST /v1/redeem` | public | Redeem a prepaid voucher |
 | `POST /v1/keys` | admin | Create a key; raw key returned once |
 | `GET /v1/keys` | admin | List hashes + counters (no raw keys) |
 | `DELETE /v1/keys/:hash` | admin | Revoke |
 | `POST /v1/keys/:hash/topup` | admin | Add credits |
 | `POST /v1/vouchers` | admin | Issue a one-time credit code |
-| `POST /v1/redeem` | public | Redeem a voucher into a key |
-| `GET /v1/usage` | key | Credits, expiry, rate remaining |
 | `GET /health`, `/`, `/openapi.yaml` | public | Ops |
 
 Admin routes are **fail-closed**: without `CORE_ADMIN_TOKEN` they return
@@ -169,7 +198,9 @@ stripped before forwarding so the connector never sees the gateway key.
 | `CORE_ADMIN_TOKEN` | — | Required for management routes |
 | `CORE_UPSTREAMS` | three localhost URLs | Service → base URL map |
 | `CORE_TIMEOUT_MS` | `20000` | Upstream timeout |
-| `CORE_DEFAULT_CREDITS` | `5000` | New key/voucher credits |
+| `CORE_DEFAULT_CREDITS` | `5000` | Admin-issued key/voucher credits |
+| `CORE_STARTER_CREDITS` | `50` | Free starter balance on `/v1/signup` |
+| `CORE_SIGNUP_PER_HOUR` | `5` | Signup limit per network (transient) |
 | `CORE_COSTS` | built-in table | `[regex, cost]` JSON pairs |
 | `CORE_RATE_PER_MIN` | `60` | Per-key limit |
 | `CORE_ALLOW_PEOPLE` | `0` | Allow personal-data routes |
@@ -184,17 +215,18 @@ stripped before forwarding so the connector never sees the gateway key.
 ## Tests
 
 ```bash
-npm test       # 22 offline unit tests
-npm run smoke  # end-to-end with a mock connector, 20 checks
+npm test       # 26 offline unit tests
+npm run smoke  # end-to-end with a mock connector, 24 checks
 ```
 
 Unit tests cover key generation and hashing, the credit table, the « charge
-only on success » rule, atomic debits, rate limiting, voucher issue / redeem /
-replay prevention, client-hash mode, the people gate, admin fail-closed
-behaviour and log redaction. The smoke test starts the gateway with a mock
-connector and verifies the full key → proxy → debit → voucher flow, including
-that no raw key or query string ever reaches disk or logs. Neither command
-makes a network call to a real service.
+only on success » rule, atomic debits, rate limiting, public signup and its
+salted abuse limiter, voucher issue / redeem / replay prevention, client-hash
+mode, the people gate, admin fail-closed behaviour and log redaction. The smoke
+test starts the gateway with a mock connector and verifies the full
+signup → proxy → debit → voucher flow plus public status, including that no
+raw key, internal URL or query string ever reaches disk or logs. Neither
+command makes a network call to a real service.
 
 ## Structure
 

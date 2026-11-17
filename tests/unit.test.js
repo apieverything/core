@@ -14,6 +14,7 @@ const registry = require("../core/registry");
 const { routeTemplate } = require("../core/logger");
 const { resolveUpstream, forwardHeaders } = require("../core/proxy");
 const { GatewayError } = require("../core/errors");
+const { SignupLimiter, signup, starterCredits, addressHash } = require("../core/signup");
 
 /* ---------- keys ---------- */
 test("keys are 16 digits and unique", () => {
@@ -255,4 +256,50 @@ test("GatewayError carries a hint and a status", () => {
   const err = new GatewayError("NO_CREDITS", "empty", 402);
   assert.equal(err.status, 402);
   assert.match(err.hint, /voucher/i);
+});
+
+/* ---------- public signup (PayAsYouGo) ---------- */
+test("signup mints a key with no expiry and stores only its hash", async () => {
+  const store = new MemoryStore();
+  const limiter = new SignupLimiter(5);
+  const req = { headers: {}, socket: { remoteAddress: "203.0.113.7" } };
+  const result = await signup(store, limiter, req);
+  assert.match(result.key, /^\d{16}$/);
+  assert.equal(result.model, "pay_as_you_go");
+  assert.equal(result.expiresAt, null, "no monthly expiry");
+  assert.equal(result.credits, 50);
+  assert.match(result.notice, /shown once/i);
+  const state = await store.read();
+  assert.equal(state.keys[result.keyHash].credits, 50);
+  assert.equal(state.keys[result.key], undefined);
+  assert.equal(state.keys[result.keyHash].expiresAt, null);
+});
+
+test("signup is rate limited per network", async () => {
+  const store = new MemoryStore();
+  const limiter = new SignupLimiter(2);
+  const req = { headers: {}, socket: { remoteAddress: "198.51.100.2" } };
+  await signup(store, limiter, req);
+  await signup(store, limiter, req);
+  await assert.rejects(() => signup(store, limiter, req), (e) => e.code === "RATE_LIMITED");
+});
+
+test("addressHash is a salted digest that never contains the raw address", () => {
+  const req = { headers: { "x-forwarded-for": "192.0.2.44" }, socket: {} };
+  const hash = addressHash(req);
+  assert.match(hash, /^[a-f0-9]{64}$/);
+  assert.ok(!hash.includes("192.0.2.44"));
+});
+
+test("starterCredits is configurable and bounded", () => {
+  const saved = process.env.CORE_STARTER_CREDITS;
+  try {
+    process.env.CORE_STARTER_CREDITS = "125";
+    assert.equal(starterCredits(), 125);
+    process.env.CORE_STARTER_CREDITS = "-4";
+    assert.equal(starterCredits(), 50);
+  } finally {
+    if (saved === undefined) delete process.env.CORE_STARTER_CREDITS;
+    else process.env.CORE_STARTER_CREDITS = saved;
+  }
 });

@@ -25,6 +25,25 @@ paths:
       responses:
         "200": { description: Usage }
         "401": { description: INVALID_KEY }
+  /v1/signup:
+    post:
+      summary: Create a key with no identity (PayAsYouGo, key shown ONCE)
+      description: >
+        Public, identity-free account creation. Returns a 16-digit key with a
+        small starter balance and no expiry — no email, no subscription, no
+        monthly reset. The gateway stores only the SHA-256 hash of the key.
+        Rate-limited by a transient in-memory hash of the client address,
+        never persisted.
+      responses:
+        "201":
+          description: Created. Save the key now; it cannot be recovered.
+        "429": { description: RATE_LIMITED }
+  /v1/status:
+    get:
+      summary: Public health of every configured connector
+      description: Returns service names, availability and latency. Internal upstream URLs are never exposed.
+      responses:
+        "200": { description: Connector status }
   /v1/redeem:
     post:
       summary: Redeem a one-time voucher for credits (no identity required)

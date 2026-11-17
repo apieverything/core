@@ -17,6 +17,8 @@ const {
   createKey, listKeys, revokeKey, topUpKey, createVoucher, redeemVoucher,
 } = require("./core/registry");
 const { upstreams, resolveUpstream, forwardHeaders, forward } = require("./core/proxy");
+const { SignupLimiter, signup } = require("./core/signup");
+const { connectorStatus, resetStatusCache } = require("./core/status");
 const logger = require("./core/logger");
 const { log } = logger;
 
@@ -33,12 +35,14 @@ const CONFIG_KEYS = [
   "CORE_INSTAGRAM_URL", "CORE_LINKEDIN_URL", "CORE_TIKTOK_URL",
   "CORE_COSTS", "CORE_RATE_PER_MIN", "CORE_TIMEOUT_MS",
   "CORE_ALLOW_PEOPLE", "CORE_ALLOW_CLIENT_HASH", "CORE_DEFAULT_CREDITS",
+  "CORE_STARTER_CREDITS", "CORE_SIGNUP_PER_HOUR",
   "CORE_STORE", "CORE_DATA_DIR", "CORE_DATA_FILE",
   "LOG_LEVEL", "NO_COLOR", "FORCE_COLOR",
 ];
 
 let store = createStore();
 let limiter = new RateLimiter({ perMinute: Number(process.env.CORE_RATE_PER_MIN ?? 60) });
+let signupLimiter = new SignupLimiter(Number(process.env.CORE_SIGNUP_PER_HOUR ?? 5));
 let bound = { port: PORT(), host: HOST() };
 let reloading = false;
 let stopping = false;
@@ -145,8 +149,11 @@ async function handle(req, res) {
         upstreams: Object.keys(upstreams()),
         peopleRoutes: ALLOW_PEOPLE() ? "allowed" : "blocked",
         dataPolicy: "Only key hashes, credit counters and expiry dates are stored.",
+        model: "PayAsYouGo — no subscription, no monthly reset, top up with vouchers",
         endpoints: {
           health: "GET /health",
+          status: "GET /v1/status",
+          signup: "POST /v1/signup (no identity, key shown once)",
           usage: "GET /v1/usage",
           redeem: "POST /v1/redeem",
           admin: "POST /v1/keys, POST /v1/vouchers (X-Admin-Token)",
@@ -174,6 +181,17 @@ async function handle(req, res) {
       const file = path.join(__dirname, "openapi.yaml");
       if (!fs.existsSync(file)) return send(res, 404, { error: { code: "NOT_FOUND" } });
       return send(res, 200, fs.readFileSync(file, "utf8"));
+    }
+
+    // Public, identity-free signup. The key is shown once and never stored.
+    if (pathname === "/v1/signup" && req.method === "POST") {
+      const result = await signup(store, signupLimiter, req);
+      return send(res, 201, result);
+    }
+
+    // Public connector health. No internal URLs are exposed.
+    if (pathname === "/v1/status" && req.method === "GET") {
+      return send(res, 200, await connectorStatus());
     }
 
     // Public voucher redemption: no identity, no key required.
@@ -328,6 +346,8 @@ async function reload() {
     log.info(`reload       ${path.basename(info.file)}${info.found ? "" : " (no .env)"}`);
     if (changed.some((k) => ["CORE_STORE", "CORE_DATA_DIR", "CORE_DATA_FILE"].includes(k))) store = createStore();
     if (changed.includes("CORE_RATE_PER_MIN")) limiter = new RateLimiter({ perMinute: Number(process.env.CORE_RATE_PER_MIN ?? 60) });
+    if (changed.includes("CORE_SIGNUP_PER_HOUR")) signupLimiter = new SignupLimiter(Number(process.env.CORE_SIGNUP_PER_HOUR ?? 5));
+    if (changed.includes("CORE_UPSTREAMS") || changed.some((k) => k.startsWith("CORE_") && k.endsWith("_URL"))) resetStatusCache();
     const nextPort = PORT(), nextHost = HOST();
     if (nextPort !== bound.port || nextHost !== bound.host) {
       await closeServer();

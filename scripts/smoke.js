@@ -91,6 +91,14 @@ async function main() {
   const noAdmin = await req("POST", "/v1/keys", {}, { credits: 10 });
   check("admin routes are protected", noAdmin.status === 401);
 
+  const signupRes = await req("POST", "/v1/signup");
+  const signupKey = signupRes.json?.key;
+  check("public signup creates a key with no identity", signupRes.status === 201 && /^\d{16}$/.test(String(signupKey)));
+  check("signup is PayAsYouGo: no expiry, starter credits", signupRes.json?.model === "pay_as_you_go" && signupRes.json?.expiresAt === null && signupRes.json?.credits === 50);
+  const status = await req("GET", "/v1/status");
+  check("public status reports every connector", status.status === 200 && status.json?.total === 3 && status.json?.healthy === 3);
+  check("status never exposes internal upstream URLs", !JSON.stringify(status.json).includes(`127.0.0.1:${upstreamPort}`));
+
   const created = await req("POST", "/v1/keys", admin, { credits: 20, expiresInDays: 30 });
   const key = created.json?.key;
   check("key created and returned once", created.status === 201 && /^\d{16}$/.test(String(key)));
@@ -132,7 +140,7 @@ async function main() {
 
   const disk = fs.readFileSync(dataFile, "utf8");
   const log = fs.readFileSync(logFile, "utf8");
-  check("raw key never written to disk", !disk.includes(key));
+  check("raw key never written to disk", !disk.includes(key) && !disk.includes(signupKey));
   check("no query strings in logs", !/cursor=SECRET|limit=2|keywords=/.test(log));
   check("no identity fields in store", !/"(email|ip|query|history|wallet)"/i.test(disk));
 
