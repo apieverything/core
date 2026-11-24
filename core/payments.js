@@ -3,6 +3,12 @@
 /**
  * Zero-identity PayAsYouGo payment -> one-time voucher bridge.
  *
+ * Supported drivers (all $0/month fixed cost):
+ *  - "nowpayments": NOWPayments REST /v1/invoice + HMAC-SHA512 IPN (x-nowpayments-sig)
+ *  - "btcpay":      BTCPay Server Greenfield API + HMAC-SHA256 webhook (btcpay-sig)
+ *  - "sandbox":     Local simulator when CORE_PAYMENT_SANDBOX=1
+ *  - "disabled":    Default fail-closed state
+ *
  * Payments stay 100% decoupled from accounts:
  *  - No email, no IP, no wallet address, no accountHash is accepted or stored.
  *  - Pending/settled invoices live in a bounded in-memory Map (max 1000, 1h TTL)
@@ -25,6 +31,7 @@ const DEFAULT_PACKS = [
 
 const MAX_INVOICES = 1000;
 const INVOICE_TTL_MS = 60 * 60 * 1000;
+const POLL_COOLDOWN_MS = 4000;
 
 function creditPacks() {
   const raw = process.env.CORE_CREDIT_PACKS?.trim();
@@ -53,6 +60,7 @@ function creditPacks() {
 }
 
 function paymentMode() {
+  if (process.env.CORE_NOWPAYMENTS_API_KEY?.trim()) return "nowpayments";
   const url = process.env.CORE_BTCPAY_URL?.trim();
   const storeId = process.env.CORE_BTCPAY_STORE_ID?.trim();
   const apiKey = process.env.CORE_BTCPAY_API_KEY?.trim();
@@ -63,6 +71,19 @@ function paymentMode() {
 
 function generateInvoiceId() {
   return `inv_${crypto.randomBytes(12).toString("hex")}`;
+}
+
+function sortObject(value) {
+  if (Array.isArray(value)) return value.map((item) => sortObject(item));
+  if (value && typeof value === "object") {
+    return Object.keys(value)
+      .sort()
+      .reduce((acc, key) => {
+        acc[key] = sortObject(value[key]);
+        return acc;
+      }, {});
+  }
+  return value;
 }
 
 function verifyWebhookSignature(rawBuffer, sigHeader, secret = process.env.CORE_WEBHOOK_SECRET?.trim()) {
@@ -81,6 +102,39 @@ function verifyWebhookSignature(rawBuffer, sigHeader, secret = process.env.CORE_
     throw new GatewayError("INVALID_SIGNATURE", "Invalid webhook signature.", 401);
   }
   return true;
+}
+
+function verifyNowPaymentsSignature(
+  payloadObj,
+  sigHeader,
+  secret = process.env.CORE_NOWPAYMENTS_IPN_SECRET?.trim() || process.env.CORE_WEBHOOK_SECRET?.trim()
+) {
+  if (!secret) {
+    throw new GatewayError("WEBHOOK_DISABLED", "NOWPayments IPN secret is not configured.", 503);
+  }
+  const header = String(sigHeader ?? "").trim();
+  if (!/^[a-fA-F0-9]{128}$/.test(header)) {
+    throw new GatewayError("INVALID_SIGNATURE", "Missing or malformed x-nowpayments-sig header.", 401);
+  }
+  const canonical = JSON.stringify(sortObject(payloadObj));
+  const expected = crypto.createHmac("sha512", secret).update(canonical).digest("hex");
+  const provided = header.toLowerCase();
+  if (!timingSafeEqual(provided, expected)) {
+    throw new GatewayError("INVALID_SIGNATURE", "Invalid NOWPayments IPN signature.", 401);
+  }
+  return true;
+}
+
+function isNowPaymentsSettled(status) {
+  const s = String(status ?? "").toLowerCase();
+  if (s === "finished") return true;
+  if (s === "confirmed" && process.env.CORE_NOWPAYMENTS_ACCEPT_CONFIRMED === "1") return true;
+  return false;
+}
+
+function parseCreditsFromOrderDescription(desc) {
+  const m = /\((\d+)\s+credits\)/i.exec(String(desc ?? ""));
+  return m ? Number(m[1]) : 0;
 }
 
 class PaymentBridge {
@@ -129,9 +183,22 @@ class PaymentBridge {
         this.invoices.delete(invId);
         continue;
       }
-      if (inv.providerInvoiceId && inv.providerInvoiceId === key) return inv;
+      if (inv.providerInvoiceId && String(inv.providerInvoiceId) === key) return inv;
     }
     return null;
+  }
+
+  _serializeInvoice(inv) {
+    return {
+      invoiceId: inv.invoiceId,
+      mode: inv.mode,
+      status: inv.status,
+      paymentStatus: inv.paymentStatus ?? null,
+      pack: inv.pack,
+      checkoutUrl: inv.checkoutUrl,
+      voucherCode: inv.voucherCode,
+      expiresAt: inv.expiresAt,
+    };
   }
 
   listPacks() {
@@ -170,6 +237,74 @@ class PaymentBridge {
         voucherCode: null,
         expiresAt,
       }, now);
+      return {
+        invoiceId: record.invoiceId,
+        mode: record.mode,
+        status: record.status,
+        pack: record.pack,
+        checkoutUrl: record.checkoutUrl,
+        expiresAt: record.expiresAt,
+      };
+    }
+
+    if (mode === "nowpayments") {
+      const baseUrl = (process.env.CORE_NOWPAYMENTS_URL?.trim() || "https://api.nowpayments.io").replace(/\/+$/, "");
+      const apiKey = process.env.CORE_NOWPAYMENTS_API_KEY.trim();
+      const payload = {
+        price_amount: pack.priceUsd,
+        price_currency: "usd",
+        order_id: invoiceId,
+        order_description: `API Everything — ${pack.name} (${pack.credits} credits)`,
+        is_fee_paid_by_user: process.env.CORE_NOWPAYMENTS_FEE_BY_USER !== "0",
+      };
+      const callbackUrl = process.env.CORE_PUBLIC_WEBHOOK_URL?.trim();
+      if (callbackUrl) payload.ipn_callback_url = callbackUrl;
+      const dashUrl = process.env.CORE_PUBLIC_DASHBOARD_URL?.trim();
+      if (dashUrl) {
+        payload.success_url = dashUrl;
+        payload.cancel_url = dashUrl;
+      }
+
+      let checkoutUrl = null;
+      let providerInvoiceId = null;
+      try {
+        const res = await this.httpClient.post(`${baseUrl}/v1/invoice`, payload, {
+          headers: {
+            "x-api-key": apiKey,
+            "Content-Type": "application/json",
+          },
+          timeout: 12_000,
+          validateStatus: () => true,
+        });
+        if (res.status < 200 || res.status >= 300 || !res.data?.invoice_url) {
+          const msg = res.data?.message || `NOWPayments returned HTTP ${res.status}`;
+          throw new Error(msg);
+        }
+        checkoutUrl = String(res.data.invoice_url);
+        providerInvoiceId = res.data.id !== undefined && res.data.id !== null ? String(res.data.id) : null;
+      } catch (err) {
+        if (err instanceof GatewayError) throw err;
+        throw new GatewayError(
+          "PAYMENT_UPSTREAM_ERROR",
+          `Could not create NOWPayments invoice: ${err.message}`,
+          502
+        );
+      }
+
+      const record = this._putInvoice({
+        invoiceId,
+        providerInvoiceId,
+        providerPaymentId: null,
+        lastPolledAt: 0,
+        mode: "nowpayments",
+        status: "pending",
+        paymentStatus: "waiting",
+        pack: { ...pack },
+        checkoutUrl,
+        voucherCode: null,
+        expiresAt,
+      }, now);
+
       return {
         invoiceId: record.invoiceId,
         mode: record.mode,
@@ -244,15 +379,42 @@ class PaymentBridge {
     if (!inv) {
       throw new GatewayError("INVOICE_NOT_FOUND", "Invoice not found or expired.", 404);
     }
-    return {
-      invoiceId: inv.invoiceId,
-      mode: inv.mode,
-      status: inv.status,
-      pack: inv.pack,
-      checkoutUrl: inv.checkoutUrl,
-      voucherCode: inv.voucherCode,
-      expiresAt: inv.expiresAt,
-    };
+    return this._serializeInvoice(inv);
+  }
+
+  async refreshInvoice(store, invoiceId) {
+    const inv = this._findInvoice(invoiceId);
+    if (!inv) {
+      throw new GatewayError("INVOICE_NOT_FOUND", "Invoice not found or expired.", 404);
+    }
+    const now = this.now();
+    const apiKey = process.env.CORE_NOWPAYMENTS_API_KEY?.trim();
+    if (
+      inv.mode === "nowpayments" &&
+      inv.status !== "settled" &&
+      inv.providerPaymentId &&
+      apiKey &&
+      typeof this.httpClient.get === "function" &&
+      now - (inv.lastPolledAt || 0) >= POLL_COOLDOWN_MS
+    ) {
+      inv.lastPolledAt = now;
+      const baseUrl = (process.env.CORE_NOWPAYMENTS_URL?.trim() || "https://api.nowpayments.io").replace(/\/+$/, "");
+      try {
+        const res = await this.httpClient.get(
+          `${baseUrl}/v1/payment/${encodeURIComponent(inv.providerPaymentId)}`,
+          { headers: { "x-api-key": apiKey }, timeout: 8_000, validateStatus: () => true }
+        );
+        if (res.status >= 200 && res.status < 300 && res.data?.payment_status) {
+          inv.paymentStatus = String(res.data.payment_status);
+          if (isNowPaymentsSettled(inv.paymentStatus)) {
+            await this._settleRecord(store, inv);
+          }
+        }
+      } catch {
+        /* Keep current in-memory status on transient upstream network error */
+      }
+    }
+    return this._serializeInvoice(inv);
   }
 
   async _settleRecord(store, inv) {
@@ -299,7 +461,96 @@ class PaymentBridge {
     };
   }
 
-  async handleWebhook(store, rawBuffer, sigHeader) {
+  async handleWebhook(store, rawBuffer, sigOrHeaders) {
+    const isHeaderMap = sigOrHeaders && typeof sigOrHeaders === "object" && !Buffer.isBuffer(sigOrHeaders);
+    const npSig = isHeaderMap ? sigOrHeaders["x-nowpayments-sig"] : null;
+    const btcpaySig = isHeaderMap ? sigOrHeaders["btcpay-sig"] : sigOrHeaders;
+
+    if (npSig !== undefined && npSig !== null || (isHeaderMap && !btcpaySig && paymentMode() === "nowpayments")) {
+      return await this._handleNowPaymentsWebhook(store, rawBuffer, npSig);
+    }
+    return await this._handleBtcPayWebhook(store, rawBuffer, btcpaySig);
+  }
+
+  async _handleNowPaymentsWebhook(store, rawBuffer, sigHeader) {
+    let payload;
+    try {
+      const text = Buffer.isBuffer(rawBuffer) ? rawBuffer.toString("utf8") : String(rawBuffer ?? "");
+      payload = JSON.parse(text);
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("not an object");
+    } catch {
+      throw new GatewayError("BAD_REQUEST", "Webhook body must be valid JSON.", 400);
+    }
+
+    verifyNowPaymentsSignature(payload, sigHeader);
+
+    const orderId = String(payload.order_id ?? "").trim();
+    const providerId = payload.invoice_id !== undefined && payload.invoice_id !== null ? String(payload.invoice_id) : "";
+    const paymentId = payload.payment_id !== undefined && payload.payment_id !== null ? String(payload.payment_id) : null;
+    const paymentStatus = String(payload.payment_status ?? "").trim();
+
+    const targetId = orderId || providerId;
+    if (!targetId) {
+      throw new GatewayError("BAD_REQUEST", "NOWPayments IPN payload is missing order_id / invoice_id.", 400);
+    }
+
+    let inv = this._findInvoice(orderId) || (providerId ? this._findInvoice(providerId) : null);
+    if (inv) {
+      if (paymentId) inv.providerPaymentId = paymentId;
+      if (paymentStatus) inv.paymentStatus = paymentStatus;
+    }
+
+    if (!isNowPaymentsSettled(paymentStatus)) {
+      return {
+        received: true,
+        settled: false,
+        provider: "nowpayments",
+        paymentStatus: paymentStatus || null,
+      };
+    }
+
+    if (!inv) {
+      const packs = creditPacks();
+      const parsedCredits = parseCreditsFromOrderDescription(payload.order_description);
+      const priceUsd = Number(payload.price_amount);
+      const matchedPack =
+        packs.find((p) => parsedCredits && p.credits === parsedCredits) ||
+        packs.find((p) => Number.isFinite(priceUsd) && Math.abs(p.priceUsd - priceUsd) < 0.01) ||
+        null;
+      const credits = parsedCredits || matchedPack?.credits || 0;
+      if (!Number.isInteger(credits) || credits < 1) {
+        throw new GatewayError("BAD_REQUEST", "Unknown NOWPayments invoice and cannot recover credit pack.", 400);
+      }
+      const now = this.now();
+      inv = this._putInvoice({
+        invoiceId: orderId || `inv_np_${providerId}`,
+        providerInvoiceId: providerId || null,
+        providerPaymentId: paymentId,
+        mode: "nowpayments",
+        status: "pending",
+        paymentStatus,
+        pack: matchedPack
+          ? { ...matchedPack }
+          : { id: "recovered", name: "NOWPayments Pack", credits, priceUsd: Number.isFinite(priceUsd) ? priceUsd : 0 },
+        checkoutUrl: null,
+        voucherCode: null,
+        expiresAt: new Date(now + this.ttlMs).toISOString(),
+      }, now);
+    }
+
+    const settled = await this._settleRecord(store, inv);
+    return {
+      received: true,
+      settled: true,
+      provider: "nowpayments",
+      invoiceId: settled.invoiceId,
+      status: "settled",
+      credits: settled.pack.credits,
+      voucherCode: settled.voucherCode,
+    };
+  }
+
+  async _handleBtcPayWebhook(store, rawBuffer, sigHeader) {
     verifyWebhookSignature(rawBuffer, sigHeader);
 
     let payload;
@@ -383,6 +634,8 @@ module.exports = {
   creditPacks,
   paymentMode,
   generateInvoiceId,
+  sortObject,
   verifyWebhookSignature,
+  verifyNowPaymentsSignature,
   PaymentBridge,
 };

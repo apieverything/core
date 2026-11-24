@@ -41,6 +41,9 @@ const CONFIG_KEYS = [
   "CORE_COSTS", "CORE_RATE_PER_MIN", "CORE_TIMEOUT_MS",
   "CORE_CACHE_ENABLED", "CORE_CACHE_TTL_MS", "CORE_CACHE_MAX_ENTRIES",
   "CORE_PAYMENT_SANDBOX", "CORE_CREDIT_PACKS",
+  "CORE_NOWPAYMENTS_API_KEY", "CORE_NOWPAYMENTS_IPN_SECRET", "CORE_NOWPAYMENTS_URL",
+  "CORE_NOWPAYMENTS_FEE_BY_USER", "CORE_NOWPAYMENTS_ACCEPT_CONFIRMED",
+  "CORE_PUBLIC_WEBHOOK_URL", "CORE_PUBLIC_DASHBOARD_URL",
   "CORE_BTCPAY_URL", "CORE_BTCPAY_STORE_ID", "CORE_BTCPAY_API_KEY", "CORE_WEBHOOK_SECRET",
   "CORE_ALLOW_PEOPLE", "CORE_ALLOW_CLIENT_HASH", "CORE_DEFAULT_CREDITS",
   "CORE_STARTER_CREDITS", "CORE_SIGNUP_PER_HOUR", "CORE_MAX_API_KEYS",
@@ -292,11 +295,11 @@ async function handle(req, res) {
       }
       if (pathname === "/v1/payments/webhook" && req.method === "POST") {
         const raw = await readRawBody(req);
-        return send(res, 200, await payments.handleWebhook(store, raw, req.headers["btcpay-sig"]));
+        return send(res, 200, await payments.handleWebhook(store, raw, req.headers));
       }
       const invoiceMatch = /^\/v1\/payments\/invoices\/([^/]+)$/.exec(pathname);
       if (invoiceMatch && req.method === "GET") {
-        return send(res, 200, payments.getInvoice(decodeURIComponent(invoiceMatch[1])));
+        return send(res, 200, await payments.refreshInvoice(store, decodeURIComponent(invoiceMatch[1])));
       }
       const settleMatch = /^\/v1\/payments\/sandbox\/([^/]+)\/settle$/.exec(pathname);
       if (settleMatch && req.method === "POST") {

@@ -16,7 +16,7 @@ const { resolveUpstream, forwardHeaders, upstreams } = require("../core/proxy");
 const { GatewayError } = require("../core/errors");
 const { SignupLimiter, signup, starterCredits, addressHash } = require("../core/signup");
 const { ResponseCache, cacheKey, shouldBypassCache } = require("../core/cache");
-const { PaymentBridge, verifyWebhookSignature, DEFAULT_PACKS } = require("../core/payments");
+const { PaymentBridge, verifyWebhookSignature, verifyNowPaymentsSignature, sortObject, DEFAULT_PACKS } = require("../core/payments");
 const { parseSimpleYaml, loadGatewaySpec, buildUnifiedOpenApi, resetOpenApiCache } = require("../core/openapi-merge");
 const crypto = require("node:crypto");
 
@@ -754,6 +754,111 @@ test("PaymentBridge BTCPay checkout and HMAC-SHA256 webhook verification", async
       if (savedEnv[k] === undefined) delete process.env[envName];
       else process.env[envName] = savedEnv[k];
     }
+  }
+});
+
+test("PaymentBridge NOWPayments checkout, sorted HMAC-SHA512 IPN, polling and restart recovery", async () => {
+  const saved = {
+    apiKey: process.env.CORE_NOWPAYMENTS_API_KEY,
+    ipnSecret: process.env.CORE_NOWPAYMENTS_IPN_SECRET,
+    webhookUrl: process.env.CORE_PUBLIC_WEBHOOK_URL,
+  };
+  const store = new MemoryStore();
+  let posted = null;
+  let pollStatus = "confirming";
+  let clock = 10_000;
+  const mockHttp = {
+    post: async (url, data, cfg) => {
+      posted = { url, data, headers: cfg.headers };
+      return {
+        status: 200,
+        data: { id: "4328618452", order_id: data.order_id, invoice_url: "https://nowpayments.io/payment/?iid=4328618452" },
+      };
+    },
+    get: async () => ({
+      status: 200,
+      data: { payment_id: 998877, payment_status: pollStatus },
+    }),
+  };
+  const bridge = new PaymentBridge({ httpClient: mockHttp, now: () => clock });
+
+  try {
+    process.env.CORE_NOWPAYMENTS_API_KEY = "np_test_key_placeholder";
+    process.env.CORE_PUBLIC_WEBHOOK_URL = "https://api.example/v1/payments/webhook";
+    delete process.env.CORE_NOWPAYMENTS_IPN_SECRET;
+
+    assert.equal(bridge.listPacks().mode, "nowpayments");
+    const checkout = await bridge.checkout({ packId: "pack_1k" });
+    assert.equal(checkout.mode, "nowpayments");
+    assert.equal(checkout.checkoutUrl, "https://nowpayments.io/payment/?iid=4328618452");
+    assert.equal(posted.headers["x-api-key"], "np_test_key_placeholder");
+    assert.equal(posted.data.order_id, checkout.invoiceId);
+    assert.equal(posted.data.is_fee_paid_by_user, true);
+    assert.equal(posted.data.ipn_callback_url, "https://api.example/v1/payments/webhook");
+
+    // Fail-closed without IPN secret
+    const waitingBody = {
+      payment_status: "waiting",
+      payment_id: 998877,
+      invoice_id: 4328618452,
+      order_id: checkout.invoiceId,
+      nested: { z: 1, a: 2 },
+    };
+    await assert.rejects(
+      () => bridge.handleWebhook(store, Buffer.from(JSON.stringify(waitingBody)), { "x-nowpayments-sig": "0".repeat(128) }),
+      (e) => e.code === "WEBHOOK_DISABLED" && e.status === 503
+    );
+
+    process.env.CORE_NOWPAYMENTS_IPN_SECRET = "ipn_secret_xyz";
+    const signNp = (obj) =>
+      crypto.createHmac("sha512", "ipn_secret_xyz").update(JSON.stringify(sortObject(obj))).digest("hex");
+
+    // Invalid signature rejected
+    await assert.rejects(
+      () => bridge.handleWebhook(store, Buffer.from(JSON.stringify(waitingBody)), { "x-nowpayments-sig": "a".repeat(128) }),
+      (e) => e.code === "INVALID_SIGNATURE" && e.status === 401
+    );
+    assert.ok(verifyNowPaymentsSignature(waitingBody, signNp(waitingBody), "ipn_secret_xyz"));
+
+    // Non-settled IPN records providerPaymentId without minting a voucher
+    const wRes = await bridge.handleWebhook(store, Buffer.from(JSON.stringify(waitingBody)), {
+      "x-nowpayments-sig": signNp(waitingBody),
+    });
+    assert.equal(wRes.settled, false);
+    assert.equal(bridge.getInvoice(checkout.invoiceId).voucherCode, null);
+
+    // Polling GET /v1/payment/:id settles once status turns "finished"
+    clock += 5_000;
+    const stillPending = await bridge.refreshInvoice(store, checkout.invoiceId);
+    assert.equal(stillPending.status, "pending");
+    pollStatus = "finished";
+    clock += 5_000;
+    const settledViaPoll = await bridge.refreshInvoice(store, checkout.invoiceId);
+    assert.equal(settledViaPoll.status, "settled");
+    assert.ok(settledViaPoll.voucherCode);
+
+    // Post-restart IPN recovery from order_description
+    const restartPayload = {
+      order_id: "inv_fedcba9876543210fedcba98",
+      invoice_id: 777111,
+      payment_id: 888222,
+      payment_status: "finished",
+      price_amount: 20,
+      order_description: "API Everything — Builder (5000 credits)",
+    };
+    const rec = await bridge.handleWebhook(store, Buffer.from(JSON.stringify(restartPayload)), {
+      "x-nowpayments-sig": signNp(restartPayload),
+    });
+    assert.equal(rec.settled, true);
+    assert.equal(rec.credits, 5000);
+    assert.ok(rec.voucherCode);
+  } finally {
+    if (saved.apiKey === undefined) delete process.env.CORE_NOWPAYMENTS_API_KEY;
+    else process.env.CORE_NOWPAYMENTS_API_KEY = saved.apiKey;
+    if (saved.ipnSecret === undefined) delete process.env.CORE_NOWPAYMENTS_IPN_SECRET;
+    else process.env.CORE_NOWPAYMENTS_IPN_SECRET = saved.ipnSecret;
+    if (saved.webhookUrl === undefined) delete process.env.CORE_PUBLIC_WEBHOOK_URL;
+    else process.env.CORE_PUBLIC_WEBHOOK_URL = saved.webhookUrl;
   }
 });
 
