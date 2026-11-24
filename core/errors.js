@@ -19,6 +19,13 @@ const HINTS = {
   BAD_VOUCHER: "Voucher not found, expired, or already redeemed.",
   BAD_KEYHASH: "keyHash must be a 64-character lowercase SHA-256 hex digest.",
   CLIENT_HASH_DISABLED: "Set CORE_ALLOW_CLIENT_HASH=1 to redeem with a client-side account hash.",
+  PAYMENTS_DISABLED: "Set CORE_PAYMENT_SANDBOX=1 for local testing or configure CORE_BTCPAY_URL, CORE_BTCPAY_STORE_ID and CORE_BTCPAY_API_KEY.",
+  BAD_PACK: "Fetch GET /v1/payments/packs for valid packId values.",
+  INVOICE_NOT_FOUND: "Check the invoiceId or create a new checkout session (invoices expire after 1 hour).",
+  SANDBOX_DISABLED: "Set CORE_PAYMENT_SANDBOX=1 to allow local sandbox settlement.",
+  WEBHOOK_DISABLED: "Set CORE_WEBHOOK_SECRET to enable signed BTCPay webhooks.",
+  INVALID_SIGNATURE: "Verify the btcpay-sig HMAC-SHA256 header against CORE_WEBHOOK_SECRET.",
+  PAYMENT_UPSTREAM_ERROR: "The payment provider did not accept the invoice request.",
   BAD_REQUEST: "Check the request body.",
 };
 

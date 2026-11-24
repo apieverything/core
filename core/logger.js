@@ -38,9 +38,14 @@ function routeTemplate(rawPath) {
   const path = String(rawPath).split("?")[0];
   // Replace only identifier segments, keeping static resource names readable.
   return path
-    .replace(/\/v1\/(instagram|tiktok)\/[^/]+\/posts/g, "/v1/$1/:id/posts")
+    .replace(/\/v1\/youtube\/videos\/[^/]+\/transcript/g, "/v1/youtube/videos/:id/transcript")
+    .replace(/\/v1\/youtube\/videos\/[^/]+/g, "/v1/youtube/videos/:id")
+    .replace(/\/v1\/(instagram|tiktok|youtube)\/[^/]+\/posts/g, "/v1/$1/:id/posts")
     .replace(/\/v1\/(instagram|tiktok)\/[^/]+/g, "/v1/$1/:id")
+    .replace(/\/v1\/youtube\/(?!search(?=\/|$)|videos(?=\/|$))[^/]+/g, "/v1/youtube/:id")
     .replace(/\/v1\/linkedin\/(jobs|company|people)\/[^/]+/g, "/v1/linkedin/$1/:id")
+    .replace(/\/v1\/payments\/sandbox\/[^/]+\/settle/g, "/v1/payments/sandbox/:id/settle")
+    .replace(/\/v1\/payments\/invoices\/[^/]+/g, "/v1/payments/invoices/:id")
     .replace(/\/v1\/admin\/accounts\/[a-f0-9]{64}/g, "/v1/admin/accounts/:hash")
     .replace(/\/v1\/keys\/[a-f0-9]{64}/g, "/v1/keys/:hash")
     .replace(/\/\d{6,}/g, "/:id");

@@ -12,9 +12,13 @@ const ledger = require("../core/ledger");
 const { RateLimiter } = require("../core/ratelimit");
 const registry = require("../core/registry");
 const { routeTemplate } = require("../core/logger");
-const { resolveUpstream, forwardHeaders } = require("../core/proxy");
+const { resolveUpstream, forwardHeaders, upstreams } = require("../core/proxy");
 const { GatewayError } = require("../core/errors");
 const { SignupLimiter, signup, starterCredits, addressHash } = require("../core/signup");
+const { ResponseCache, cacheKey, shouldBypassCache } = require("../core/cache");
+const { PaymentBridge, verifyWebhookSignature, DEFAULT_PACKS } = require("../core/payments");
+const { parseSimpleYaml, loadGatewaySpec, buildUnifiedOpenApi, resetOpenApiCache } = require("../core/openapi-merge");
+const crypto = require("node:crypto");
 
 /* ---------- two credential classes ---------- */
 test("unlock codes are 16 digits and unique", () => {
@@ -444,4 +448,376 @@ test("starterCredits is configurable and bounded", () => {
     if (saved === undefined) delete process.env.CORE_STARTER_CREDITS;
     else process.env.CORE_STARTER_CREDITS = saved;
   }
+});
+
+/* ---------- YouTube upstream & weighted costs ---------- */
+test("YouTube upstream defaults to port 3003 and weights feeds/search/transcripts at 2 credits", () => {
+  const savedUpstreams = process.env.CORE_UPSTREAMS;
+  const savedYt = process.env.CORE_YOUTUBE_URL;
+  try {
+    delete process.env.CORE_UPSTREAMS;
+    delete process.env.CORE_YOUTUBE_URL;
+    assert.equal(upstreams().youtube, "http://127.0.0.1:3003");
+    process.env.CORE_YOUTUBE_URL = "http://yt-box:4321";
+    assert.equal(upstreams().youtube, "http://yt-box:4321");
+  } finally {
+    if (savedUpstreams === undefined) delete process.env.CORE_UPSTREAMS;
+    else process.env.CORE_UPSTREAMS = savedUpstreams;
+    if (savedYt === undefined) delete process.env.CORE_YOUTUBE_URL;
+    else process.env.CORE_YOUTUBE_URL = savedYt;
+  }
+
+  assert.equal(ledger.costFor("/v1/youtube/@mkbhd/posts"), 2);
+  assert.equal(ledger.costFor("/v1/youtube/mkbhd/posts?limit=12"), 2);
+  assert.equal(ledger.costFor("/v1/youtube/search?q=open+source"), 2);
+  assert.equal(ledger.costFor("/v1/youtube/videos/dQw4w9WgXcQ/transcript?lang=en"), 2);
+  assert.equal(ledger.costFor("/v1/youtube/@mkbhd"), 1);
+  assert.equal(ledger.costFor("/v1/youtube/videos/dQw4w9WgXcQ"), 1);
+
+  assert.equal(routeTemplate("/v1/youtube/@mkbhd/posts?limit=2"), "/v1/youtube/:id/posts");
+  assert.equal(routeTemplate("/v1/youtube/search?q=secret"), "/v1/youtube/search");
+  assert.equal(routeTemplate("/v1/youtube/videos/dQw4w9WgXcQ/transcript?lang=en"), "/v1/youtube/videos/:id/transcript");
+  assert.equal(routeTemplate("/v1/payments/invoices/inv_1234567890abcdef12345678"), "/v1/payments/invoices/:id");
+  assert.equal(routeTemplate("/v1/payments/sandbox/inv_1234567890abcdef12345678/settle"), "/v1/payments/sandbox/:id/settle");
+});
+
+/* ---------- privacy-first RAM cache + coalescing ---------- */
+test("cacheKey hashes method + path + query and never retains raw URLs in memory", async () => {
+  const k1 = cacheKey("GET", "/v1/youtube/search", "?q=private+query");
+  const k2 = cacheKey("HEAD", "/v1/youtube/search", "?q=private+query");
+  assert.match(k1, /^[a-f0-9]{64}$/);
+  assert.notEqual(k1, k2);
+  assert.ok(!k1.includes("private"));
+
+  const c = new ResponseCache({ enabled: true, ttlMs: 5000, maxEntries: 10 });
+  await c.resolve({
+    method: "GET",
+    pathname: "/v1/youtube/search",
+    search: "?q=supersecret",
+    loader: async () => ({ status: 200, body: '{"items":[1]}', contentType: "application/json" }),
+  });
+  const dump = JSON.stringify([...c.entries.entries()]);
+  assert.ok(!dump.includes("supersecret"));
+  assert.ok(!dump.includes("/v1/youtube"));
+});
+
+test("ResponseCache MISS -> HIT, Cache-Control BYPASS, TTL expiry and LRU eviction", async () => {
+  let clock = 10_000;
+  let calls = 0;
+  const c = new ResponseCache({ enabled: true, ttlMs: 1000, maxEntries: 2, now: () => clock });
+  const loader = async () => {
+    calls += 1;
+    return { status: 200, body: JSON.stringify({ call: calls }), contentType: "application/json" };
+  };
+
+  const first = await c.resolve({ method: "GET", pathname: "/v1/instagram/a", loader });
+  assert.equal(first.xCache, "MISS");
+  assert.equal(calls, 1);
+
+  const second = await c.resolve({ method: "GET", pathname: "/v1/instagram/a", loader });
+  assert.equal(second.xCache, "HIT");
+  assert.equal(second.response.body, '{"call":1}');
+  assert.equal(calls, 1);
+
+  assert.equal(shouldBypassCache("no-cache"), true);
+  assert.equal(shouldBypassCache("max-age=0, no-store"), true);
+  const bypassed = await c.resolve({
+    method: "GET",
+    pathname: "/v1/instagram/a",
+    cacheControl: "no-cache",
+    loader,
+  });
+  assert.equal(bypassed.xCache, "BYPASS");
+  assert.equal(bypassed.response.body, '{"call":2}');
+  assert.equal(calls, 2);
+
+  // Fresh value from BYPASS updated the cache.
+  const hitUpdated = await c.resolve({ method: "GET", pathname: "/v1/instagram/a", loader });
+  assert.equal(hitUpdated.xCache, "HIT");
+  assert.equal(hitUpdated.response.body, '{"call":2}');
+
+  // LRU eviction when maxEntries = 2: insert b, touch a, insert c -> b is evicted.
+  await c.resolve({ method: "GET", pathname: "/v1/instagram/b", loader });
+  await c.resolve({ method: "GET", pathname: "/v1/instagram/a", loader }); // refresh a
+  await c.resolve({ method: "GET", pathname: "/v1/instagram/c", loader }); // evicts b
+  assert.equal(c.stats().entries, 2);
+  const aStillHit = await c.resolve({ method: "GET", pathname: "/v1/instagram/a", loader });
+  assert.equal(aStillHit.xCache, "HIT");
+  const bMiss = await c.resolve({ method: "GET", pathname: "/v1/instagram/b", loader });
+  assert.equal(bMiss.xCache, "MISS");
+
+  // TTL expiry evicts stale entries.
+  clock += 2000;
+  assert.equal(c.stats().entries, 0);
+});
+
+test("ResponseCache coalesces 10 concurrent misses into 1 upstream call", async () => {
+  const c = new ResponseCache({ enabled: true, ttlMs: 60_000, maxEntries: 50 });
+  let upstreamHits = 0;
+  const loader = async () => {
+    upstreamHits += 1;
+    await new Promise((r) => setTimeout(r, 20));
+    return { status: 200, body: '{"videos":[{"id":"v1"}]}', contentType: "application/json" };
+  };
+
+  const results = await Promise.all(
+    Array.from({ length: 10 }, () =>
+      c.resolve({ method: "GET", pathname: "/v1/youtube/@mkbhd/posts", search: "?limit=2", loader })
+    )
+  );
+  assert.equal(upstreamHits, 1, "forward() must execute exactly ONCE");
+  const states = results.map((r) => r.xCache);
+  assert.equal(states.filter((s) => s === "MISS").length, 1);
+  assert.equal(states.filter((s) => s === "COALESCED").length, 9);
+
+  const followUp = await c.resolve({ method: "GET", pathname: "/v1/youtube/@mkbhd/posts", search: "?limit=2", loader });
+  assert.equal(followUp.xCache, "HIT");
+  assert.equal(upstreamHits, 1);
+  assert.deepEqual(c.stats(), {
+    enabled: true,
+    entries: 1,
+    maxEntries: 50,
+    ttlMs: 60_000,
+    hits: 1,
+    misses: 1,
+    coalesced: 9,
+  });
+});
+
+test("ResponseCache never caches non-billable responses, POSTs, or when disabled", async () => {
+  const c = new ResponseCache({ enabled: true, ttlMs: 60_000, maxEntries: 10 });
+  let hits = 0;
+  await c.resolve({
+    method: "GET",
+    pathname: "/v1/tiktok/x/posts",
+    loader: async () => { hits += 1; return { status: 429, body: '{"error":{"code":"RATE"}}', contentType: "application/json" }; },
+  });
+  await c.resolve({
+    method: "GET",
+    pathname: "/v1/tiktok/x/posts",
+    loader: async () => { hits += 1; return { status: 200, body: '{"error":{"code":"BAD"}}', contentType: "application/json" }; },
+  });
+  assert.equal(hits, 2);
+  assert.equal(c.stats().entries, 0);
+
+  const postRes = await c.resolve({
+    method: "POST",
+    pathname: "/v1/instagram/x",
+    loader: async () => ({ status: 200, body: '{"ok":true}', contentType: "application/json" }),
+  });
+  assert.equal(postRes.xCache, "BYPASS");
+  assert.equal(c.stats().entries, 0);
+
+  const disabled = new ResponseCache({ enabled: false });
+  const offRes = await disabled.resolve({
+    method: "GET",
+    pathname: "/v1/instagram/x",
+    loader: async () => ({ status: 200, body: '{"ok":true}', contentType: "application/json" }),
+  });
+  assert.equal(offRes.xCache, "BYPASS");
+});
+
+/* ---------- payments -> voucher bridge ---------- */
+test("PaymentBridge disabled by default and blocks sandbox settle when CORE_PAYMENT_SANDBOX=0", async () => {
+  const savedSandbox = process.env.CORE_PAYMENT_SANDBOX;
+  const savedUrl = process.env.CORE_BTCPAY_URL;
+  const store = new MemoryStore();
+  const bridge = new PaymentBridge();
+  try {
+    delete process.env.CORE_BTCPAY_URL;
+    process.env.CORE_PAYMENT_SANDBOX = "0";
+    const packs = bridge.listPacks();
+    assert.equal(packs.enabled, false);
+    assert.equal(packs.mode, "disabled");
+    assert.equal(packs.packs.length, DEFAULT_PACKS.length);
+
+    await assert.rejects(() => bridge.checkout({ packId: "pack_1k" }), (e) => e.code === "PAYMENTS_DISABLED" && e.status === 503);
+    await assert.rejects(() => bridge.sandboxSettle(store, "inv_" + "a".repeat(24)), (e) => e.code === "SANDBOX_DISABLED" && e.status === 403);
+  } finally {
+    if (savedSandbox === undefined) delete process.env.CORE_PAYMENT_SANDBOX;
+    else process.env.CORE_PAYMENT_SANDBOX = savedSandbox;
+    if (savedUrl === undefined) delete process.env.CORE_BTCPAY_URL;
+    else process.env.CORE_BTCPAY_URL = savedUrl;
+  }
+});
+
+test("PaymentBridge sandbox checkout -> idempotent settle -> voucher redeem stays zero-identity", async () => {
+  const savedSandbox = process.env.CORE_PAYMENT_SANDBOX;
+  const store = new MemoryStore();
+  let now = 50_000;
+  const bridge = new PaymentBridge({ maxInvoices: 3, ttlMs: 3_600_000, now: () => now });
+  try {
+    process.env.CORE_PAYMENT_SANDBOX = "1";
+    await assert.rejects(() => bridge.checkout({ packId: "nope" }), (e) => e.code === "BAD_PACK" && e.status === 400);
+
+    const inv = await bridge.checkout({ packId: "pack_1k" });
+    assert.match(inv.invoiceId, /^inv_[a-f0-9]{24}$/);
+    assert.equal(inv.mode, "sandbox");
+    assert.equal(inv.status, "pending");
+    assert.equal(inv.checkoutUrl, null);
+
+    const pending = bridge.getInvoice(inv.invoiceId);
+    assert.equal(pending.voucherCode, null);
+
+    // Concurrent settle calls mint only ONE voucher.
+    const [s1, s2] = await Promise.all([
+      bridge.sandboxSettle(store, inv.invoiceId),
+      bridge.sandboxSettle(store, inv.invoiceId),
+    ]);
+    assert.equal(s1.status, "settled");
+    assert.equal(s1.credits, 1000);
+    assert.equal(s1.voucherCode, s2.voucherCode);
+    assert.equal(Object.keys((await store.read()).vouchers).length, 1);
+
+    // Turning off sandbox immediately blocks settle even for existing invoices.
+    process.env.CORE_PAYMENT_SANDBOX = "0";
+    await assert.rejects(() => bridge.sandboxSettle(store, inv.invoiceId), (e) => e.code === "SANDBOX_DISABLED" && e.status === 403);
+
+    // Voucher redeems cleanly into an account, and store never contains invoiceId.
+    const { unlockCode } = await registry.createAccount(store, { credits: 25 });
+    const redeemed = await registry.redeemVoucher(store, { code: s1.voucherCode, unlockCode });
+    assert.equal(redeemed.credits, 1025);
+    assert.ok(!JSON.stringify(await store.read()).includes(inv.invoiceId));
+
+    // After 1h TTL, invoice vanishes from memory.
+    now += 3_600_001;
+    assert.throws(() => bridge.getInvoice(inv.invoiceId), (e) => e.code === "INVOICE_NOT_FOUND" && e.status === 404);
+  } finally {
+    if (savedSandbox === undefined) delete process.env.CORE_PAYMENT_SANDBOX;
+    else process.env.CORE_PAYMENT_SANDBOX = savedSandbox;
+  }
+});
+
+test("PaymentBridge BTCPay checkout and HMAC-SHA256 webhook verification", async () => {
+  const savedEnv = {
+    url: process.env.CORE_BTCPAY_URL,
+    storeId: process.env.CORE_BTCPAY_STORE_ID,
+    apiKey: process.env.CORE_BTCPAY_API_KEY,
+    secret: process.env.CORE_WEBHOOK_SECRET,
+  };
+  const store = new MemoryStore();
+  let posted = null;
+  const mockHttp = {
+    post: async (url, data, cfg) => {
+      posted = { url, data, headers: cfg.headers };
+      return { status: 200, data: { id: "btcpay_99", checkoutLink: "https://pay.example/i/btcpay_99" } };
+    },
+  };
+  const bridge = new PaymentBridge({ httpClient: mockHttp });
+
+  try {
+    process.env.CORE_BTCPAY_URL = "https://pay.example";
+    process.env.CORE_BTCPAY_STORE_ID = "store_1";
+    process.env.CORE_BTCPAY_API_KEY = "secret_key";
+    delete process.env.CORE_WEBHOOK_SECRET;
+
+    const checkout = await bridge.checkout({ packId: "pack_5k" });
+    assert.equal(checkout.mode, "btcpay");
+    assert.equal(checkout.checkoutUrl, "https://pay.example/i/btcpay_99");
+    assert.equal(posted.headers.Authorization, "token secret_key");
+    assert.equal(posted.data.metadata.invoiceId, checkout.invoiceId);
+    assert.equal(posted.data.metadata.credits, 5000);
+
+    // Webhook fail-closed without CORE_WEBHOOK_SECRET.
+    const rawBody = Buffer.from(JSON.stringify({
+      type: "InvoiceSettled",
+      invoiceId: "btcpay_99",
+      metadata: { invoiceId: checkout.invoiceId, packId: "pack_5k", credits: 5000 },
+    }, null, 2));
+    await assert.rejects(() => bridge.handleWebhook(store, rawBody, "sha256=" + "0".repeat(64)), (e) => e.code === "WEBHOOK_DISABLED" && e.status === 503);
+
+    process.env.CORE_WEBHOOK_SECRET = "whsec_test_123";
+    await assert.rejects(() => bridge.handleWebhook(store, rawBody, "sha256=" + "f".repeat(64)), (e) => e.code === "INVALID_SIGNATURE" && e.status === 401);
+    assert.throws(() => verifyWebhookSignature(rawBody, "badheader", "whsec_test_123"), (e) => e.code === "INVALID_SIGNATURE");
+
+    const sig = "sha256=" + crypto.createHmac("sha256", "whsec_test_123").update(rawBody).digest("hex");
+    const first = await bridge.handleWebhook(store, rawBody, sig);
+    const replay = await bridge.handleWebhook(store, rawBody, sig);
+    assert.equal(first.settled, true);
+    assert.equal(first.credits, 5000);
+    assert.equal(first.voucherCode, replay.voucherCode, "webhook settlement must be idempotent");
+    assert.equal(bridge.getInvoice(checkout.invoiceId).voucherCode, first.voucherCode);
+
+    // Post-restart webhook: unknown invoiceId reconstructed from metadata.credits.
+    const restartRaw = Buffer.from('{"type":"InvoicePaymentSettled","metadata":{"invoiceId":"inv_0123456789abcdef01234567","credits":20000}}');
+    const restartSig = "sha256=" + crypto.createHmac("sha256", "whsec_test_123").update(restartRaw).digest("hex");
+    const recovered = await bridge.handleWebhook(store, restartRaw, restartSig);
+    assert.equal(recovered.credits, 20000);
+    assert.equal(bridge.getInvoice("inv_0123456789abcdef01234567").voucherCode, recovered.voucherCode);
+  } finally {
+    for (const [k, envName] of [
+      ["url", "CORE_BTCPAY_URL"],
+      ["storeId", "CORE_BTCPAY_STORE_ID"],
+      ["apiKey", "CORE_BTCPAY_API_KEY"],
+      ["secret", "CORE_WEBHOOK_SECRET"],
+    ]) {
+      if (savedEnv[k] === undefined) delete process.env[envName];
+      else process.env[envName] = savedEnv[k];
+    }
+  }
+});
+
+/* ---------- unified OpenAPI 3.0.3 ---------- */
+test("Unified OpenAPI parses v0.3.0 spec, merges connector paths, and falls back offline", async () => {
+  resetOpenApiCache();
+  const base = loadGatewaySpec();
+  assert.equal(base.openapi, "3.0.3");
+  assert.equal(base.info.version, "0.3.0");
+  assert.ok(base.paths["/v1/openapi.json"]);
+  assert.ok(base.paths["/v1/payments/packs"]);
+  assert.ok(base.paths["/v1/payments/webhook"]);
+  const serviceParam = base.paths["/v1/{service}/{path}"].get.parameters.find((p) => p.name === "service");
+  assert.ok(serviceParam.schema.enum.includes("youtube"));
+  assert.ok(base.paths["/v1/{service}/{path}"].get.responses["200"].headers["X-Cache"]);
+
+  const sampleYtYaml = [
+    "openapi: 3.0.3",
+    "info:",
+    "  title: YouTube connector",
+    "  version: 1.0.0",
+    "paths:",
+    "  /health:",
+    "    get:",
+    '      responses: { "200": { description: OK } }',
+    "  /v1/youtube/{handle}/posts:",
+    "    get:",
+    "      summary: Channel videos",
+    "      responses:",
+    '        "200":',
+    "          description: Videos",
+    "          content:",
+    "            application/json:",
+    "              schema: { $ref: \"#/components/schemas/Video\" }",
+    "components:",
+    "  schemas:",
+    "    Video:",
+    "      type: object",
+    "      properties:",
+    "        videoId: { type: string }",
+  ].join("\n");
+
+  const parsedYt = parseSimpleYaml(sampleYtYaml);
+  assert.equal(parsedYt.info.title, "YouTube connector");
+
+  const merged = await buildUnifiedOpenApi({
+    force: true,
+    upstreamMap: {
+      youtube: "http://127.0.0.1:19991",
+      instagram: "http://127.0.0.1:19992",
+    },
+    httpClient: {
+      get: async (url) => {
+        if (url.includes("19991")) return { status: 200, data: sampleYtYaml };
+        throw new Error("ECONNREFUSED");
+      },
+    },
+  });
+
+  assert.equal(merged.openapi, "3.0.3");
+  assert.ok(merged.paths["/v1/youtube/{handle}/posts"]);
+  assert.equal(merged.paths["/v1/youtube/{handle}/posts"].get["x-credits-cost"], 2);
+  assert.ok(merged.components.schemas.YoutubeVideo);
+  assert.deepEqual(merged["x-discovered-services"], ["youtube"]);
+  assert.ok(!JSON.stringify(merged).includes("19991"), "must never leak internal upstream URLs");
+  resetOpenApiCache();
 });

@@ -13,6 +13,7 @@ function upstreams() {
   }
   return {
     instagram: process.env.CORE_INSTAGRAM_URL || "http://127.0.0.1:3000",
+    youtube: process.env.CORE_YOUTUBE_URL || "http://127.0.0.1:3003",
     linkedin: process.env.CORE_LINKEDIN_URL || "http://127.0.0.1:3002",
     tiktok: process.env.CORE_TIKTOK_URL || "http://127.0.0.1:3001",
   };

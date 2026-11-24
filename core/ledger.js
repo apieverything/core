@@ -8,10 +8,12 @@
 const DEFAULT_COSTS = [
   [/^\/v1\/instagram\/[^/]+\/posts/, 3],
   [/^\/v1\/tiktok\/[^/]+\/posts/, 3],
+  [/^\/v1\/youtube\/([^/]+\/posts|search|videos\/[^/]+\/transcript)(\/|$)/, 2],
   [/^\/v1\/linkedin\/signals\//, 2],
   [/^\/v1\/linkedin\/people\//, 5],
   [/^\/v1\/linkedin\/jobs\/[^/]+/, 1],
   [/^\/v1\/instagram\//, 1],
+  [/^\/v1\/youtube\//, 1],
   [/^\/v1\/tiktok\//, 1],
   [/^\/v1\/linkedin\//, 1],
 ];

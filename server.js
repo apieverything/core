@@ -19,6 +19,9 @@ const registry = require("./core/registry");
 const { upstreams, resolveUpstream, forwardHeaders, forward } = require("./core/proxy");
 const { SignupLimiter, signup } = require("./core/signup");
 const { connectorStatus, resetStatusCache } = require("./core/status");
+const { ResponseCache } = require("./core/cache");
+const { PaymentBridge } = require("./core/payments");
+const { buildUnifiedOpenApi, resetOpenApiCache } = require("./core/openapi-merge");
 const logger = require("./core/logger");
 const { log } = logger;
 
@@ -29,12 +32,16 @@ const ADMIN = () => process.env.CORE_ADMIN_TOKEN?.trim() || null;
 const TIMEOUT = () => Math.max(1000, Number(process.env.CORE_TIMEOUT_MS ?? 20000));
 const ALLOW_PEOPLE = () => process.env.CORE_ALLOW_PEOPLE === "1";
 const MAX_BODY = 64 * 1024;
-const CORS_HEADERS = "Content-Type, X-API-Key, X-Unlock-Code, X-Admin-Token";
+const CORS_HEADERS = "Content-Type, X-API-Key, X-Unlock-Code, X-Admin-Token, Cache-Control";
+const EXPOSE_HEADERS = "X-Credits-Cost, X-Credits-Remaining, X-RateLimit-Remaining, X-Charged, X-Cache";
 
 const CONFIG_KEYS = [
   "PORT", "HOST", "CORE_ADMIN_TOKEN", "CORE_UPSTREAMS",
-  "CORE_INSTAGRAM_URL", "CORE_LINKEDIN_URL", "CORE_TIKTOK_URL",
+  "CORE_INSTAGRAM_URL", "CORE_YOUTUBE_URL", "CORE_LINKEDIN_URL", "CORE_TIKTOK_URL",
   "CORE_COSTS", "CORE_RATE_PER_MIN", "CORE_TIMEOUT_MS",
+  "CORE_CACHE_ENABLED", "CORE_CACHE_TTL_MS", "CORE_CACHE_MAX_ENTRIES",
+  "CORE_PAYMENT_SANDBOX", "CORE_CREDIT_PACKS",
+  "CORE_BTCPAY_URL", "CORE_BTCPAY_STORE_ID", "CORE_BTCPAY_API_KEY", "CORE_WEBHOOK_SECRET",
   "CORE_ALLOW_PEOPLE", "CORE_ALLOW_CLIENT_HASH", "CORE_DEFAULT_CREDITS",
   "CORE_STARTER_CREDITS", "CORE_SIGNUP_PER_HOUR", "CORE_MAX_API_KEYS",
   "CORE_STORE", "CORE_DATA_DIR", "CORE_DATA_FILE",
@@ -44,6 +51,8 @@ const CONFIG_KEYS = [
 let store = createStore();
 let limiter = new RateLimiter({ perMinute: Number(process.env.CORE_RATE_PER_MIN ?? 60) });
 let signupLimiter = new SignupLimiter(Number(process.env.CORE_SIGNUP_PER_HOUR ?? 5));
+const cache = new ResponseCache();
+const payments = new PaymentBridge();
 let bound = { port: PORT(), host: HOST() };
 let reloading = false;
 let stopping = false;
@@ -53,6 +62,7 @@ function send(res, status, payload, extra = {}) {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers": CORS_HEADERS,
+      "Access-Control-Expose-Headers": EXPOSE_HEADERS,
       "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     });
     return res.end();
@@ -63,6 +73,7 @@ function send(res, status, payload, extra = {}) {
     "Content-Length": Buffer.byteLength(body),
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": CORS_HEADERS,
+    "Access-Control-Expose-Headers": EXPOSE_HEADERS,
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     ...extra,
   });
@@ -80,16 +91,22 @@ function fail(res, err) {
   return send(res, 500, { error: { code: "INTERNAL_ERROR", message: "Internal gateway error." } });
 }
 
-async function readBody(req) {
+async function readRawBody(req) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
-    size += chunk.length;
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buf.length;
     if (size > MAX_BODY) throw new GatewayError("BAD_REQUEST", "Request body too large.", 413);
-    chunks.push(chunk);
+    chunks.push(buf);
   }
-  if (!chunks.length) return {};
-  const text = Buffer.concat(chunks).toString("utf8");
+  return Buffer.concat(chunks);
+}
+
+async function readBody(req) {
+  const raw = await readRawBody(req);
+  if (!raw.length) return {};
+  const text = raw.toString("utf8");
   try {
     const parsed = JSON.parse(text);
     return parsed && typeof parsed === "object" ? parsed : {};
@@ -212,10 +229,12 @@ async function handle(req, res) {
           unlock: "POST /v1/unlock (X-Unlock-Code)",
           keys: "GET|POST /v1/keys, POST /v1/keys/reset, DELETE /v1/keys/:id (X-Unlock-Code)",
           usage: "GET /v1/usage (X-API-Key or X-Unlock-Code)",
+          payments: "GET /v1/payments/packs, POST /v1/payments/checkout",
           redeem: "POST /v1/redeem",
           admin: "POST /v1/vouchers, /v1/admin/accounts (X-Admin-Token)",
           proxy: "GET|POST /v1/:service/... (X-API-Key only)",
           schema: "GET /openapi.yaml",
+          openapi: "GET /v1/openapi.json",
         },
       });
     }
@@ -234,6 +253,7 @@ async function handle(req, res) {
         vouchers: Object.values(state.vouchers).filter((v) => !v.redeemed).length,
         adminEnabled: Boolean(ADMIN()),
         peopleRoutes: ALLOW_PEOPLE() ? "allowed" : "blocked",
+        cache: cache.stats(),
       });
     }
 
@@ -241,6 +261,13 @@ async function handle(req, res) {
       const file = path.join(__dirname, "openapi.yaml");
       if (!fs.existsSync(file)) return send(res, 404, { error: { code: "NOT_FOUND" } });
       return send(res, 200, fs.readFileSync(file, "utf8"));
+    }
+
+    if (pathname === "/v1/openapi.json") {
+      if (req.method !== "GET") {
+        return send(res, 404, { error: { code: "NOT_FOUND", message: "Unknown route." } });
+      }
+      return send(res, 200, await buildUnifiedOpenApi());
     }
 
     // Public, identity-free signup. Returns the UNLOCK CODE, shown once.
@@ -252,6 +279,30 @@ async function handle(req, res) {
     // Public connector health. No internal URLs are exposed.
     if (pathname === "/v1/status" && req.method === "GET") {
       return send(res, 200, await connectorStatus());
+    }
+
+    // Zero-identity PayAsYouGo payment -> voucher bridge.
+    if (pathname === "/v1/payments" || pathname.startsWith("/v1/payments/")) {
+      if (pathname === "/v1/payments/packs" && req.method === "GET") {
+        return send(res, 200, payments.listPacks());
+      }
+      if (pathname === "/v1/payments/checkout" && req.method === "POST") {
+        const body = await readBody(req);
+        return send(res, 201, await payments.checkout(body));
+      }
+      if (pathname === "/v1/payments/webhook" && req.method === "POST") {
+        const raw = await readRawBody(req);
+        return send(res, 200, await payments.handleWebhook(store, raw, req.headers["btcpay-sig"]));
+      }
+      const invoiceMatch = /^\/v1\/payments\/invoices\/([^/]+)$/.exec(pathname);
+      if (invoiceMatch && req.method === "GET") {
+        return send(res, 200, payments.getInvoice(decodeURIComponent(invoiceMatch[1])));
+      }
+      const settleMatch = /^\/v1\/payments\/sandbox\/([^/]+)\/settle$/.exec(pathname);
+      if (settleMatch && req.method === "POST") {
+        return send(res, 200, await payments.sandboxSettle(store, decodeURIComponent(settleMatch[1])));
+      }
+      return send(res, 404, { error: { code: "NOT_FOUND", message: "Unknown payment route." } });
     }
 
     // Public voucher redemption: no identity, credits an account.
@@ -366,14 +417,35 @@ async function handle(req, res) {
     if (!target) throw new GatewayError("UNKNOWN_SERVICE", `No upstream for /v1/${match[1]}.`, 502);
 
     const upstreamUrl = `${target.base}${target.path}${url.search}`;
-    const body = req.method === "GET" || req.method === "HEAD" ? null : await readBody(req);
-    const upstream = await forward({
-      method: req.method,
-      url: upstreamUrl,
-      body,
-      headers: forwardHeaders(req),
-      timeoutMs: TIMEOUT(),
-    });
+    let upstream;
+    let xCache = "BYPASS";
+
+    if (req.method === "GET" || req.method === "HEAD") {
+      const resolved = await cache.resolve({
+        method: req.method,
+        pathname,
+        search: url.search,
+        cacheControl: req.headers["cache-control"],
+        loader: () => forward({
+          method: req.method,
+          url: upstreamUrl,
+          body: null,
+          headers: forwardHeaders(req),
+          timeoutMs: TIMEOUT(),
+        }),
+      });
+      upstream = resolved.response;
+      xCache = resolved.xCache;
+    } else {
+      const body = await readBody(req);
+      upstream = await forward({
+        method: req.method,
+        url: upstreamUrl,
+        body,
+        headers: forwardHeaders(req),
+        timeoutMs: TIMEOUT(),
+      });
+    }
 
     const charged = billable(upstream.status, upstream.body);
     if (charged) {
@@ -390,14 +462,16 @@ async function handle(req, res) {
       "X-Credits-Remaining": String(remaining),
       "X-RateLimit-Remaining": String(auth.rate.remaining),
       "X-Charged": charged ? "true" : "false",
+      "X-Cache": xCache,
     };
     res.writeHead(upstream.status, {
       ...headers,
       "Content-Length": Buffer.byteLength(upstream.body),
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers": CORS_HEADERS,
+      "Access-Control-Expose-Headers": EXPOSE_HEADERS,
     });
-    return res.end(upstream.body);
+    return req.method === "HEAD" ? res.end() : res.end(upstream.body);
   } catch (err) {
     return fail(res, err);
   } finally {
@@ -453,7 +527,16 @@ async function reload() {
     if (changed.some((k) => ["CORE_STORE", "CORE_DATA_DIR", "CORE_DATA_FILE"].includes(k))) store = createStore();
     if (changed.includes("CORE_RATE_PER_MIN")) limiter = new RateLimiter({ perMinute: Number(process.env.CORE_RATE_PER_MIN ?? 60) });
     if (changed.includes("CORE_SIGNUP_PER_HOUR")) signupLimiter = new SignupLimiter(Number(process.env.CORE_SIGNUP_PER_HOUR ?? 5));
-    if (changed.includes("CORE_UPSTREAMS") || changed.some((k) => k.startsWith("CORE_") && k.endsWith("_URL"))) resetStatusCache();
+    if (changed.some((k) => ["CORE_CACHE_ENABLED", "CORE_CACHE_TTL_MS", "CORE_CACHE_MAX_ENTRIES"].includes(k))) {
+      cache.configure();
+    }
+    if (changed.some((k) => k.startsWith("CORE_PAYMENT_") || k.startsWith("CORE_BTCPAY_") || k === "CORE_CREDIT_PACKS" || k === "CORE_WEBHOOK_SECRET")) {
+      payments.purgeExpired();
+    }
+    if (changed.includes("CORE_UPSTREAMS") || changed.includes("CORE_ALLOW_PEOPLE") || changed.some((k) => k.startsWith("CORE_") && k.endsWith("_URL"))) {
+      resetStatusCache();
+      resetOpenApiCache();
+    }
     const nextPort = PORT(), nextHost = HOST();
     if (nextPort !== bound.port || nextHost !== bound.host) {
       await closeServer();
@@ -497,4 +580,4 @@ async function start() {
 }
 start().catch((err) => { console.error(`[api] Could not start: ${err.message}`); process.exit(1); });
 
-module.exports = { server, reload, config };
+module.exports = { server, reload, config, cache, payments };
